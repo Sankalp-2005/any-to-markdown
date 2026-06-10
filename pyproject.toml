@@ -1,0 +1,35 @@
+[project]
+name = "any-to-markdown"
+version = "0.1.3"
+description = "A light-weight package to convert virtually any file and youtube links to formatted markdown"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [
+    { name = "Sankalp Joshi" }
+]
+
+keywords = [
+    "markdown",
+    "rag",
+    "pdf",
+    "ocr",
+    "transcription",
+    "youtube"
+]
+dependencies = [
+    "pandas>=2.2.0",
+    "pymupdf>=1.26.0",
+    "python-docx>=1.1.0",
+    "python-pptx>=1.0.2",
+    "typing-extensions>=4.12.0",
+    "faster-whisper>=1.2.1",
+    "python-multipart>=0.0.28",
+    "pytesseract>=0.3.13",
+    "pillow>=12.2.0",
+    "xlrd>=2.0.1",
+    "tabulate>=0.10.0",
+    "openpyxl>=3.1.0",
+    "youtube-transcript-api>=1.2.4",
+    "yt-dlp>=2026.6.9",
+]
