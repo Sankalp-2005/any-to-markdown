@@ -1,12 +1,12 @@
 [project]
 name = "any-to-markdown"
-version = "0.1.3"
+version = "0.1.4"
 description = "A light-weight package to convert virtually any file and youtube links to formatted markdown"
 readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "MIT" }
 authors = [
-    { name = "Sankalp Joshi" }
+    { name = "Sankalp Joshi", email = "sankalpjoshi2005@gmail.com" }
 ]
 
 keywords = [
@@ -32,4 +32,11 @@ dependencies = [
     "openpyxl>=3.1.0",
     "youtube-transcript-api>=1.2.4",
     "yt-dlp>=2026.6.9",
+    "pymupdf4llm>=0.0.17",
+    "pymupdf-layout>=0.0.5",
+    "nbformat>=5.10.4",
 ]
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+packages = ["any_to_markdown"]

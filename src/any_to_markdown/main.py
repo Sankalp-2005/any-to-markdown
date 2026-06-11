@@ -1,14 +1,16 @@
-"""
-Main orchestration module for the any-to-markdown processing engine.
+"""Main orchestration module for the any-to-markdown processing engine.
 
 Handles concurrency, input routing (files vs. URLs), and batch directory processing.
 """
 
+from __future__ import annotations
+
 import asyncio
 import os
+import re
 import tempfile
 from pathlib import Path
-from typing import Callable, Iterable, List
+from typing import Callable, Dict, Iterable, List, Optional, Union
 from uuid import uuid4
 
 import yt_dlp
@@ -19,13 +21,13 @@ from . import input_handler
 
 # Files larger than this will be processed sequentially to avoid Out-Of-Memory (OOM) errors.
 # This is especially important for heavy handlers like Whisper or OCR.
-MAX_PARALLEL_SIZE = 200 * 1024 * 1024  # 200MB
+MAX_PARALLEL_SIZE: int = 200 * 1024 * 1024  # 200MB
 
 # Number of concurrent tasks allowed for smaller files.
-MAX_CONCURRENT_TASKS = 10
+MAX_CONCURRENT_TASKS: int = 10
 
 # Globally recognized file extensions for the processing pipeline.
-allowed_extensions = {
+ALLOWED_EXTENSIONS: set[str] = {
     ".txt",
     ".json",
     ".md",
@@ -39,12 +41,32 @@ allowed_extensions = {
     ".jpg",
     ".mp3",
     ".mp4",
+    ".ipynb",
+    ".py",
+    ".js",
+    ".ts",
+    ".cpp",
+    ".c",
+    ".h",
+    ".hpp",
+    ".rs",
+    ".go",
+    ".java",
+    ".rb",
+    ".php",
+    ".sh",
+    ".sql",
+    ".yaml",
+    ".yml",
+    ".xml",
+    ".html",
+    ".css",
 }
 
 # Mapping of file extensions to their respective processing functions in input_handler.
-HANDLERS: dict[str, Callable[[str | Path], str]] = {
+HANDLERS: Dict[str, Callable[[Union[str, Path], ...], str]] = {
     ".txt": input_handler.handle_text,
-    ".json": input_handler.handle_text,
+    ".json": input_handler.handle_code,
     ".md": input_handler.handle_text,
     ".docx": input_handler.handle_document,
     ".xls": input_handler.handle_excel,
@@ -56,26 +78,76 @@ HANDLERS: dict[str, Callable[[str | Path], str]] = {
     ".jpeg": input_handler.handle_image,
     ".mp3": input_handler.handle_audio,
     ".mp4": input_handler.handle_video,
+    ".ipynb": input_handler.handle_notebook,
+    ".py": input_handler.handle_code,
+    ".js": input_handler.handle_code,
+    ".ts": input_handler.handle_code,
+    ".cpp": input_handler.handle_code,
+    ".c": input_handler.handle_code,
+    ".h": input_handler.handle_code,
+    ".hpp": input_handler.handle_code,
+    ".rs": input_handler.handle_code,
+    ".go": input_handler.handle_code,
+    ".java": input_handler.handle_code,
+    ".rb": input_handler.handle_code,
+    ".php": input_handler.handle_code,
+    ".sh": input_handler.handle_code,
+    ".sql": input_handler.handle_code,
+    ".yaml": input_handler.handle_code,
+    ".yml": input_handler.handle_code,
+    ".xml": input_handler.handle_code,
+    ".html": input_handler.handle_code,
+    ".css": input_handler.handle_code,
 }
 
 
-async def _process_input(input_val: str | Path, semaphore: asyncio.Semaphore) -> str:
-    """Internal wrapper to execute handlers for files or YouTube URLs.
+def _sanitize_error(error: Exception) -> str:
+    """Sanitizes error messages to prevent leaking system-specific info.
 
-    Features:
-    - Concurrency control via semaphores.
-    - Automatic routing to YouTube transcript API vs. local file handlers.
-    - Thread-pool offloading for CPU-bound tasks via asyncio.to_thread.
+    Replaces absolute paths with just the filename and limits message length.
 
     Args:
-        input_val (str | Path): The input file path or YouTube URL.
-        semaphore (asyncio.Semaphore): The concurrency gate to respect.
+        error: The exception to sanitize.
 
     Returns:
-        str: The generated Markdown content.
+        A sanitized error string.
+    """
+    error_msg = str(error)
+
+    # Regex to identify potential absolute paths (Unix and Windows styles)
+    path_regex = r"(/[a-zA-Z0-9\._\-/]+)|([a-zA-Z]:\\[a-zA-Z0-9\._\-\\]+)"
+
+    def mask_path(match: re.Match[str]) -> str:
+        full_path = match.group(0)
+        # Avoid masking very short strings or common symbols
+        if len(full_path) > 5:
+            try:
+                return Path(full_path).name
+            except Exception:
+                return "[REDACTED_PATH]"
+        return full_path
+
+    sanitized = re.sub(path_regex, mask_path, error_msg)
+
+    if len(sanitized) > 500:
+        sanitized = sanitized[:497] + "..."
+
+    return sanitized
+
+
+async def _process_input(input_val: str | Path, semaphore: asyncio.Semaphore, use_layout_engine: bool = False) -> str:
+    """Internal wrapper to execute handlers for files or YouTube URLs.
+
+    Args:
+        input_val: The input file path or YouTube URL.
+        semaphore: The concurrency gate to respect.
+        use_layout_engine: Whether to use advanced PDF layout analysis.
+
+    Returns:
+        The generated Markdown content.
 
     Raises:
-        RuntimeError: If a YouTube transcript is unavailable and requires local processing.
+        RuntimeError: If a YouTube transcript is unavailable.
     """
     async with semaphore:
         input_str = str(input_val)
@@ -85,15 +157,11 @@ async def _process_input(input_val: str | Path, semaphore: asyncio.Semaphore) ->
         if yt_id:
             metadata_header = f"\n---\nsource: YouTube\nid: {yt_id}\ntype: youtube\n---\n\n"
             try:
-                # YouTube fetching is mostly I/O bound but we use a thread to keep loop free
                 content = await asyncio.to_thread(input_handler.handle_youtube, yt_id)
                 return f"{metadata_header}{content}"
             except Exception as e:
-                # Informative error suggesting local fallback if transcripts are unavailable
                 raise RuntimeError(
-                    f"No transcript available for YouTube video {yt_id}. "
-                    f"Original error: {str(e)}. "
-                    "Please use 'handle_yt_local' for this video to generate a transcript locally using Whisper."
+                    f"No transcript available for YouTube video {yt_id}. Original error: {str(e)}. Please use 'handle_yt_local' for this video."
                 ) from e
 
         # 2. Routing: Local File Handling
@@ -101,9 +169,7 @@ async def _process_input(input_val: str | Path, semaphore: asyncio.Semaphore) ->
         ext = file_path.suffix.lower()
         handler = HANDLERS.get(ext)
 
-        # Standard Metadata header for Markdown outputs
         if ext == ".pdf":
-            # PDF handler manages its own metadata per page
             metadata_header = ""
         else:
             metadata_header = f"\n---\nsource: {file_path.name}\ntype: {ext.lstrip('.')}\n---\n\n"
@@ -113,68 +179,62 @@ async def _process_input(input_val: str | Path, semaphore: asyncio.Semaphore) ->
             return f"{unsupported_header}### [Warning: Unsupported format {ext}]\n\n"
 
         try:
-            # Offload heavy CPU/OCR/Whisper work to a separate thread to prevent blocking the event loop
-            content = await asyncio.to_thread(handler, file_path)
+            if ext == ".pdf":
+                content = await asyncio.to_thread(handler, file_path, use_layout_engine)
+            else:
+                content = await asyncio.to_thread(handler, file_path)
             return f"{metadata_header}{content}"
         except Exception as e:
-            error_header = metadata_header or (f"\n---\nsource: {file_path.name}\ntype: {ext.lstrip('.')}\n---\n\n")
-            return f"{error_header}### [Error processing file: {str(e)}]\n\n"
+            error_header = metadata_header or f"\n---\nsource: {file_path.name}\ntype: {ext.lstrip('.')}\n---\n\n"
+            sanitized_error = _sanitize_error(e)
+            return f"{error_header}### [Error processing file: {sanitized_error}]\n\n"
 
 
-async def get_markdown(inputs: Iterable[str | Path]) -> List[str]:
+async def get_markdown(inputs: str | Path | Iterable[str | Path], use_layout_engine: bool = False) -> List[str]:
     """The main conversion engine for a batch of files and YouTube URLs.
 
-    Orchestration:
-    - Smart Concurrency: Parallelizes small files, sequences large files (>200MB).
-    - Resource Safety: Uses semaphores to cap memory/CPU usage.
-    - Persistence: Saves results to the 'raw_data/' directory with collision-resistant naming.
-
     Args:
-        inputs (Iterable[str | Path]): A collection of local file paths or YouTube URLs.
+        inputs: A single path or a collection of file paths or YouTube URLs.
+        use_layout_engine: Whether to use advanced PDF layout analysis.
 
     Returns:
-        List[str]: A list of absolute paths to the generated Markdown files in 'raw_data/'.
+        A list of absolute paths to the generated Markdown files.
     """
-    input_list = list(inputs)
+    if isinstance(inputs, (str, Path)):
+        input_list = [inputs]
+    else:
+        input_list = list(inputs)
+
     small_task_semaphore = asyncio.Semaphore(MAX_CONCURRENT_TASKS)
     large_file_semaphore = asyncio.Semaphore(1)
 
     raw_data_dir = Path.cwd() / "raw_data"
     raw_data_dir.mkdir(parents=True, exist_ok=True)
 
-    pending_tasks = []
-
-    # Prepare and schedule all tasks based on input type and size
+    pending_tasks: List[asyncio.Task[str] | asyncio.Future[str]] = []
     for item in input_list:
         input_str = str(item)
         yt_id = input_handler.extract_youtube_id(input_str)
 
         if yt_id:
-            # YouTube API calls are relatively low-resource (small tasks)
             pending_tasks.append(asyncio.create_task(_process_input(input_str, small_task_semaphore)))
             continue
 
         file_path = Path(item)
-        if file_path.suffix.lower() not in allowed_extensions:
-            # Immediate feedback for unsupported files
+        if file_path.suffix.lower() not in ALLOWED_EXTENSIONS:
             error_msg = f"\n\n---\n### [Warning: Input not supported: {file_path.name}]\n---\n\n"
-            f = asyncio.Future()
+            f: asyncio.Future[str] = asyncio.Future()
             f.set_result(error_msg)
             pending_tasks.append(f)
             continue
 
-        # Resource Gate: Prevent OOM by sequencing large files
         file_size = file_path.stat().st_size
-        if file_size <= MAX_PARALLEL_SIZE:
-            pending_tasks.append(asyncio.create_task(_process_input(file_path, small_task_semaphore)))
-        else:
-            pending_tasks.append(asyncio.create_task(_process_input(file_path, large_file_semaphore)))
+        sem = small_task_semaphore if file_size <= MAX_PARALLEL_SIZE else large_file_semaphore
+        pending_tasks.append(asyncio.create_task(_process_input(file_path, sem, use_layout_engine)))
 
-    output_paths = []
-    # Collect results as they finish and persist them to disk
+    output_paths: List[str] = []
     for item, task in zip(input_list, pending_tasks):
         result = await task
-
         input_str = str(item)
         yt_id = input_handler.extract_youtube_id(input_str)
 
@@ -188,14 +248,13 @@ async def get_markdown(inputs: Iterable[str | Path]) -> List[str]:
         out_name = f"{base_name}.md"
         out_path = raw_data_dir / out_name
 
-        # Increment suffix to prevent overwriting existing results in raw_data/
         counter = 1
         while out_path.exists():
             out_name = f"{base_name}_{counter}.md"
             out_path = raw_data_dir / out_name
             counter += 1
 
-        with open(out_path, "w", encoding="utf-8") as md_file:
+        with out_path.open("w", encoding="utf-8") as md_file:
             md_file.write(result)
 
         output_paths.append(str(out_path))
@@ -203,16 +262,15 @@ async def get_markdown(inputs: Iterable[str | Path]) -> List[str]:
     return output_paths
 
 
-async def get_markdown_directory(directory_path: str | Path) -> List[str] | None:
-    """Crawls a directory recursively and converts all supported files to Markdown.
-
-    Ensures a deterministic, sorted order for consistent batch output.
+async def get_markdown_directory(directory_path: str | Path, use_layout_engine: bool = False) -> Optional[List[str]]:
+    """Crawls a directory recursively and converts supported files.
 
     Args:
-        directory_path (str | Path): Path to the source directory.
+        directory_path: Path to the source directory.
+        use_layout_engine: Whether to use advanced PDF layout analysis.
 
     Returns:
-        List[str] | None: List of output file paths, or None if no supported files found.
+        List of output file paths, or None if no supported files found.
 
     Raises:
         ValueError: If the provided path is not a valid directory.
@@ -221,50 +279,36 @@ async def get_markdown_directory(directory_path: str | Path) -> List[str] | None
     if not dir_path.is_dir():
         raise ValueError(f"The path {directory_path} is not a valid directory.")
 
-    file_list = []
+    file_list: List[Path] = []
     for root, _, filenames in os.walk(dir_path):
         for filename in filenames:
             file_path = Path(root) / filename
-            if file_path.suffix.lower() in allowed_extensions:
+            if file_path.suffix.lower() in ALLOWED_EXTENSIONS:
                 file_list.append(file_path)
 
     if not file_list:
         return None
 
-    # Sorting ensures that outputs like collisions (counter suffixes) are consistent across runs
     file_list.sort()
-    return await get_markdown(file_list)
+    return await get_markdown(file_list, use_layout_engine=use_layout_engine)
 
 
 def handle_yt_local(urls: str | List[str]) -> List[str]:
-    """Heavy-duty YouTube processor: Downloads videos and transcribes locally via Whisper.
-
-    Use Case:
-    - Use this when YouTube transcripts are disabled or unavailable.
-
-    Workflow:
-    1. Downloads video/audio using yt-dlp.
-    2. Enforces a 200MB safety limit on downloads.
-    3. Offloads transcription to input_handler.handle_video (Whisper).
-    4. Automatically purges downloaded video files.
+    """Heavy-duty YouTube processor using Whisper transcription.
 
     Args:
-        urls (str | List[str]): A single YouTube URL or a list of URLs.
+        urls: A single YouTube URL or a list of URLs.
 
     Returns:
-        List[str]: A list of generated Markdown transcription strings.
+        A list of generated Markdown transcription strings.
     """
-    if isinstance(urls, str):
-        urls = [urls]
+    url_list = [urls] if isinstance(urls, str) else urls
+    transcriptions: List[str] = []
 
-    transcriptions = []
-
-    for url in urls:
+    for url in url_list:
         temp_dir = tempfile.gettempdir()
-        # Random UUID prevents collisions in shared temp directories
         out_tmpl = str(Path(temp_dir) / f"yt_{uuid4()}.%(ext)s")
 
-        # Configuration for downloading the best available format that works with FFmpeg
         ydl_opts = {
             "format": "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best",
             "outtmpl": out_tmpl,
@@ -277,20 +321,17 @@ def handle_yt_local(urls: str | List[str]) -> List[str]:
                 info = ydl.extract_info(url, download=True)
                 downloaded_file = ydl.prepare_filename(info)
 
-            # Security: Prevent rogue downloads from exhausting system resources
-            file_size = Path(downloaded_file).stat().st_size
-            if file_size > 200 * 1024 * 1024:
-                Path(downloaded_file).unlink(missing_ok=True)
+            path = Path(downloaded_file)
+            if path.stat().st_size > 200 * 1024 * 1024:
+                path.unlink(missing_ok=True)
                 raise ValueError("file is too large to process")
 
-            # Orchestration: Reuse the existing video transcription pipeline
             transcription = input_handler.handle_video(downloaded_file)
             transcriptions.append(transcription)
-
-            # Cleanup downloaded video immediately to free up disk space
-            Path(downloaded_file).unlink(missing_ok=True)
+            path.unlink(missing_ok=True)
 
         except Exception as e:
-            transcriptions.append(f"\n\n### [Error processing YouTube video locally: {str(e)}]\n\n")
+            sanitized_error = _sanitize_error(e)
+            transcriptions.append(f"\n\n### [Error processing YouTube video locally: {sanitized_error}]\n\n")
 
     return transcriptions
