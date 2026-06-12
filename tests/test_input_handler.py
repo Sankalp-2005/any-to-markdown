@@ -57,3 +57,62 @@ def test_handle_csv_produces_markdown_table(tmp_path: Path) -> None:
     assert "alice" in result
     assert "bob" in result
     assert "|" in result
+
+
+def test_handle_text_tolerates_non_utf8_bytes(tmp_path: Path) -> None:
+    legacy = tmp_path / "legacy.txt"
+    legacy.write_bytes("caf\u00e9 cr\u00e8me".encode("latin-1"))
+
+    result = input_handler.handle_text(legacy)
+
+    assert "caf\u00e9 cr\u00e8me" in result
+
+
+def test_handle_text_strips_utf8_bom(tmp_path: Path) -> None:
+    bom_file = tmp_path / "bom.txt"
+    bom_file.write_bytes(b"\xef\xbb\xbfhello")
+
+    result = input_handler.handle_text(bom_file)
+
+    assert "hello" in result
+    assert "\ufeff" not in result
+
+
+def test_handle_html_converts_structure(tmp_path: Path) -> None:
+    html = (
+        "<html><head><title>Ignored</title><style>body { color: red; }</style></head><body>"
+        "<h1>Title</h1>"
+        '<p>Hello <strong>world</strong>, see <a href="https://example.com">the docs</a>.</p>'
+        "<ul><li>one</li><li>two</li></ul>"
+        "<table><tr><th>a</th><th>b</th></tr><tr><td>1</td><td>2</td></tr></table>"
+        "<script>alert('xss')</script>"
+        "</body></html>"
+    )
+    page = tmp_path / "page.html"
+    page.write_text(html, encoding="utf-8")
+
+    result = input_handler.handle_html(page)
+
+    assert "# Title" in result
+    assert "**world**" in result
+    assert "[the docs](https://example.com)" in result
+    assert "- one" in result
+    assert "- two" in result
+    assert "| a | b |" in result
+    assert "| 1 | 2 |" in result
+    # Script and style content must be stripped entirely.
+    assert "alert" not in result
+    assert "color: red" not in result
+    assert "Ignored" not in result
+
+
+def test_handle_html_ordered_list_and_code(tmp_path: Path) -> None:
+    html = "<ol><li>first</li><li>second</li></ol><p>Use <code>pip</code>.</p>"
+    page = tmp_path / "snippet.htm"
+    page.write_text(html, encoding="utf-8")
+
+    result = input_handler.handle_html(page)
+
+    assert "1. first" in result
+    assert "2. second" in result
+    assert "`pip`" in result
