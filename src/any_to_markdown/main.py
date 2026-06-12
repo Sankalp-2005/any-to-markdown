@@ -26,6 +26,11 @@ MAX_PARALLEL_SIZE: int = 200 * 1024 * 1024  # 200MB
 # Number of concurrent tasks allowed for smaller files.
 MAX_CONCURRENT_TASKS: int = 10
 
+# Extensions that require Whisper transcription. These are always routed through
+# a dedicated transcription semaphore so that multiple Whisper jobs never run
+# concurrently, regardless of file size.
+TRANSCRIPTION_EXTENSIONS: set[str] = {".mp3", ".mp4", ".wav", ".m4a"}
+
 # Globally recognized file extensions for the processing pipeline.
 ALLOWED_EXTENSIONS: set[str] = {
     ".txt",
@@ -202,12 +207,19 @@ async def _process_input(input_val: str | Path, semaphore: asyncio.Semaphore, us
             return f"{error_header}### [Error processing file: {sanitized_error}]\n\n"
 
 
-async def get_markdown(inputs: str | Path | Iterable[str | Path], use_layout_engine: bool = False) -> List[str]:
+async def get_markdown(
+    inputs: str | Path | Iterable[str | Path],
+    use_layout_engine: bool = False,
+    max_transcriptions: int = 1,
+) -> List[str]:
     """The main conversion engine for a batch of files and YouTube URLs.
 
     Args:
         inputs: A single path or a collection of file paths or YouTube URLs.
         use_layout_engine: Whether to use advanced PDF layout analysis.
+        max_transcriptions: Maximum number of concurrent Whisper transcription
+            jobs for audio/video files. Defaults to 1 because transcription is
+            CPU/memory heavy.
 
     Returns:
         A list of absolute paths to the generated Markdown files.
@@ -219,6 +231,7 @@ async def get_markdown(inputs: str | Path | Iterable[str | Path], use_layout_eng
 
     small_task_semaphore = asyncio.Semaphore(MAX_CONCURRENT_TASKS)
     large_file_semaphore = asyncio.Semaphore(1)
+    transcription_semaphore = asyncio.Semaphore(max_transcriptions)
 
     raw_data_dir = Path.cwd() / "raw_data"
     raw_data_dir.mkdir(parents=True, exist_ok=True)
@@ -247,8 +260,14 @@ async def get_markdown(inputs: str | Path | Iterable[str | Path], use_layout_eng
             pending_tasks.append(missing)
             continue
 
-        file_size = file_path.stat().st_size
-        sem = small_task_semaphore if file_size <= MAX_PARALLEL_SIZE else large_file_semaphore
+        ext = file_path.suffix.lower()
+        if ext in TRANSCRIPTION_EXTENSIONS:
+            # Whisper jobs are CPU/memory heavy: never run N of them in parallel,
+            # regardless of how small the files are.
+            sem = transcription_semaphore
+        else:
+            file_size = file_path.stat().st_size
+            sem = small_task_semaphore if file_size <= MAX_PARALLEL_SIZE else large_file_semaphore
         pending_tasks.append(asyncio.create_task(_process_input(file_path, sem, use_layout_engine)))
 
     output_paths: List[str] = []
@@ -281,12 +300,18 @@ async def get_markdown(inputs: str | Path | Iterable[str | Path], use_layout_eng
     return output_paths
 
 
-async def get_markdown_directory(directory_path: str | Path, use_layout_engine: bool = False) -> Optional[List[str]]:
+async def get_markdown_directory(
+    directory_path: str | Path,
+    use_layout_engine: bool = False,
+    max_transcriptions: int = 1,
+) -> Optional[List[str]]:
     """Crawls a directory recursively and converts supported files.
 
     Args:
         directory_path: Path to the source directory.
         use_layout_engine: Whether to use advanced PDF layout analysis.
+        max_transcriptions: Maximum number of concurrent Whisper transcription
+            jobs for audio/video files.
 
     Returns:
         List of output file paths, or None if no supported files found.
@@ -309,11 +334,17 @@ async def get_markdown_directory(directory_path: str | Path, use_layout_engine: 
         return None
 
     file_list.sort()
-    return await get_markdown(file_list, use_layout_engine=use_layout_engine)
+    return await get_markdown(
+        file_list, use_layout_engine=use_layout_engine, max_transcriptions=max_transcriptions
+    )
 
 
 def handle_yt_local(urls: str | List[str]) -> List[str]:
     """Heavy-duty YouTube processor using Whisper transcription.
+
+    Downloads the audio-only stream (no video) and feeds it directly to the
+    Whisper engine. This means smaller downloads, no transcoding, and no
+    FFmpeg requirement for this path (faster-whisper accepts m4a/webm directly).
 
     Args:
         urls: A single YouTube URL or a list of URLs.
@@ -329,7 +360,9 @@ def handle_yt_local(urls: str | List[str]) -> List[str]:
         out_tmpl = str(Path(temp_dir) / f"yt_{uuid4()}.%(ext)s")
 
         ydl_opts = {
-            "format": "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best",
+            # Audio-only download: smaller transfer, no transcode, and no FFmpeg
+            # requirement, since faster-whisper accepts m4a/webm directly.
+            "format": "bestaudio[ext=m4a]/bestaudio/best",
             "outtmpl": out_tmpl,
             "quiet": True,
             "no_warnings": True,
@@ -345,7 +378,9 @@ def handle_yt_local(urls: str | List[str]) -> List[str]:
                 path.unlink(missing_ok=True)
                 raise ValueError("file is too large to process")
 
-            transcription = input_handler.handle_video(downloaded_file)
+            # Feed the audio file straight to Whisper; skip handle_video's
+            # ffmpeg-based audio extraction entirely.
+            transcription = input_handler.handle_audio(downloaded_file)
             transcriptions.append(transcription)
             path.unlink(missing_ok=True)
 
