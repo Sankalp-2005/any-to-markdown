@@ -156,7 +156,10 @@ async def _process_input(input_val: str | Path, semaphore: asyncio.Semaphore, us
         use_layout_engine: Whether to use advanced PDF layout analysis.
 
     Returns:
-        The generated Markdown content, or error markdown if processing fails.
+        The generated Markdown content.
+
+    Raises:
+        RuntimeError: If a YouTube transcript is unavailable.
     """
     async with semaphore:
         input_str = str(input_val)
@@ -169,13 +172,9 @@ async def _process_input(input_val: str | Path, semaphore: asyncio.Semaphore, us
                 content = await asyncio.to_thread(input_handler.handle_youtube, yt_id)
                 return f"{metadata_header}{content}"
             except Exception as e:
-                # Match the file-error contract: return error markdown instead of raising,
-                # so one failed video cannot abort an entire batch.
-                sanitized_error = _sanitize_error(e)
-                return (
-                    f"{metadata_header}### [Error: No transcript available for YouTube video {yt_id}: "
-                    f"{sanitized_error}. Please use 'handle_yt_local' for this video.]\n\n"
-                )
+                raise RuntimeError(
+                    f"No transcript available for YouTube video {yt_id}. Original error: {str(e)}. Please use 'handle_yt_local' for this video."
+                ) from e
 
         # 2. Routing: Local File Handling
         file_path = Path(input_val)
