@@ -1,6 +1,10 @@
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
 [project]
 name = "any-to-markdown"
-version = "0.1.5"
+version = "0.2.0"
 description = "A light-weight package to convert virtually any file and youtube links to formatted markdown"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -17,29 +21,47 @@ keywords = [
     "transcription",
     "youtube"
 ]
+
+# Core dependencies cover text, code, notebooks, CSV/Excel, DOCX, and PPTX.
+# Heavy capabilities (PDF, OCR, audio transcription, YouTube) are opt-in extras.
 dependencies = [
     "pandas>=2.2.0",
-    "pymupdf>=1.26.0",
+    "tabulate>=0.10.0",
     "python-docx>=1.1.0",
     "python-pptx>=1.0.2",
-    "typing-extensions>=4.12.0",
-    "faster-whisper>=1.2.1",
-    "python-multipart>=0.0.28",
-    "pytesseract>=0.3.13",
-    "pillow>=12.2.0",
-    "xlrd>=2.0.1",
-    "tabulate>=0.10.0",
     "openpyxl>=3.1.0",
-    "youtube-transcript-api>=1.2.4",
-    "yt-dlp>=2026.6.9",
-    "pymupdf4llm>=0.0.17",
-    "pymupdf-layout>=0.0.5",
+    "xlrd>=2.0.1",
     "nbformat>=5.10.4",
+    "typing-extensions>=4.12.0",
 ]
 
-[tool.setuptools]
-package-dir = {"" = "src"}
-packages = ["any_to_markdown"]
+[project.optional-dependencies]
+pdf = [
+    "pymupdf>=1.26.0",
+    "pymupdf4llm>=0.0.17",
+    "pymupdf-layout>=0.0.5",
+]
+ocr = [
+    "pytesseract>=0.3.13",
+    "pillow>=12.2.0",
+]
+audio = [
+    "faster-whisper>=1.2.1",
+]
+youtube = [
+    "youtube-transcript-api>=1.2.4",
+    "yt-dlp>=2026.6.9",
+]
+all = [
+    "pymupdf>=1.26.0",
+    "pymupdf4llm>=0.0.17",
+    "pymupdf-layout>=0.0.5",
+    "pytesseract>=0.3.13",
+    "pillow>=12.2.0",
+    "faster-whisper>=1.2.1",
+    "youtube-transcript-api>=1.2.4",
+    "yt-dlp>=2026.6.9",
+]
 
 [dependency-groups]
 dev = [
@@ -47,6 +69,10 @@ dev = [
     "mypy>=1.10.0",
     "ruff>=0.4.0",
 ]
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+packages = ["any_to_markdown"]
 
 [tool.mypy]
 ignore_missing_imports = true

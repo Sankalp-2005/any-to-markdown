@@ -10,17 +10,21 @@ import pytest
 from any_to_markdown import input_handler, main
 
 
-def test_get_markdown_missing_file_writes_error_markdown(
+def test_get_markdown_missing_file_returns_error_result(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.chdir(tmp_path)
 
-    outputs = asyncio.run(main.get_markdown(str(tmp_path / "missing.pdf")))
+    with pytest.warns(UserWarning, match="File not found"):
+        results = asyncio.run(main.get_markdown(str(tmp_path / "missing.pdf")))
 
-    assert len(outputs) == 1
-    content = Path(outputs[0]).read_text(encoding="utf-8")
-    assert "File not found" in content
-    assert "missing.pdf" in content
+    assert len(results) == 1
+    result = results[0]
+    assert result.status == "error"
+    assert not result.ok
+    assert result.error is not None and "missing.pdf" in result.error
+    assert result.output_path is None
+    assert result.content is None
 
 
 def test_get_markdown_youtube_with_mocked_transcript(
@@ -34,12 +38,63 @@ def test_get_markdown_youtube_with_mocked_transcript(
 
     monkeypatch.setattr(input_handler, "handle_youtube", fake_handle_youtube)
 
-    outputs = asyncio.run(main.get_markdown("https://www.youtube.com/watch?v=dQw4w9WgXcQ"))
+    results = asyncio.run(main.get_markdown("https://www.youtube.com/watch?v=dQw4w9WgXcQ"))
 
-    assert len(outputs) == 1
-    content = Path(outputs[0]).read_text(encoding="utf-8")
-    assert "mocked transcript text" in content
-    assert "id: dQw4w9WgXcQ" in content
+    assert len(results) == 1
+    result = results[0]
+    assert result.ok
+    assert result.content is not None and "mocked transcript text" in result.content
+    assert result.output_path is not None and result.output_path.exists()
+    assert "id: dQw4w9WgXcQ" in result.output_path.read_text(encoding="utf-8")
+    # Default output dir: a Path object is returned, no message is set.
+    assert result.message is None
+
+
+def test_get_markdown_custom_output_dir_returns_success_message(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    source = tmp_path / "note.txt"
+    source.write_text("hello world", encoding="utf-8")
+    out_dir = tmp_path / "converted"
+
+    results = asyncio.run(main.get_markdown(str(source), output_dir=out_dir))
+
+    result = results[0]
+    assert result.ok
+    assert result.message is not None and "Success" in result.message
+    assert result.output_path is not None and result.output_path.parent == out_dir
+    # The default directory must not be created when output_dir is given.
+    assert not (tmp_path / "raw_data").exists()
+
+
+def test_one_failure_never_kills_the_batch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    good = tmp_path / "good.txt"
+    good.write_text("fine content", encoding="utf-8")
+
+    with pytest.warns(UserWarning, match="Batch summary"):
+        results = asyncio.run(main.get_markdown([str(good), str(tmp_path / "missing.txt")]))
+
+    assert [r.status for r in results] == ["success", "error"]
+    assert results[0].output_path is not None and results[0].output_path.exists()
+
+
+def test_unsupported_extension_is_skipped(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    weird = tmp_path / "data.xyz"
+    weird.write_text("?", encoding="utf-8")
+
+    with pytest.warns(UserWarning, match="Unsupported"):
+        results = asyncio.run(main.get_markdown(str(weird)))
+
+    assert results[0].status == "skipped"
+    # Nothing succeeded, so no output directory should be created.
+    assert not (tmp_path / "raw_data").exists()
 
 
 def test_transcription_extensions_are_gated() -> None:
