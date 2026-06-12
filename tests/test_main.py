@@ -99,3 +99,29 @@ def test_unsupported_extension_is_skipped(
 
 def test_transcription_extensions_are_gated() -> None:
     assert main.TRANSCRIPTION_EXTENSIONS == {".mp3", ".mp4", ".wav", ".m4a"}
+
+
+def test_sanitize_error_preserves_urls_and_masks_paths() -> None:
+    exc = ValueError(
+        "Failed for https://www.youtube.com/watch?v=dQw4w9WgXcQ "
+        "while reading /home/user/secret/file.txt"
+    )
+
+    sanitized = main._sanitize_error(exc)
+
+    # The URL must survive intact (its path portion is not a local path leak).
+    assert "https://www.youtube.com/watch?v=dQw4w9WgXcQ" in sanitized
+    # The absolute filesystem path must be masked down to the filename.
+    assert "/home/user/secret" not in sanitized
+    assert "file.txt" in sanitized
+
+
+def test_get_markdown_directory_empty_returns_empty_list(tmp_path: Path) -> None:
+    results = asyncio.run(main.get_markdown_directory(tmp_path))
+    assert results == []
+
+
+def test_download_cap_is_distinct_from_concurrency_threshold() -> None:
+    # Both exist independently so tuning one never silently changes the other.
+    assert main.MAX_DOWNLOAD_SIZE == 200 * 1024 * 1024
+    assert main.MAX_PARALLEL_SIZE == 200 * 1024 * 1024

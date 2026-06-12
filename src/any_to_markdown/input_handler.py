@@ -780,4 +780,3 @@ def handle_youtube(video_id_or_url: str) -> str:
             f"No transcript available for YouTube video {video_id}: {e}. "
             "Use handle_yt_local() to transcribe it locally instead."
         ) from e
-
