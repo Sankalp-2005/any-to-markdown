@@ -132,7 +132,7 @@ def handle_document(file_path: str | Path) -> str:
     Returns:
         Consolidated Markdown content of the document.
     """
-    user_doc = Document(file_path)
+    user_doc = Document(str(file_path))
     parts: List[str] = []
 
     # Direct access to the body elements allows us to maintain strict document order
@@ -200,7 +200,7 @@ def handle_powerpoint(file_path: str | Path) -> str:
     Returns:
         Segmented Markdown content per slide.
     """
-    ppt = Presentation(file_path)
+    ppt = Presentation(str(file_path))
     parts: List[str] = []
     for i, slide in enumerate(ppt.slides, start=1):
         parts.append(f"## Slide {i}\n\n")
