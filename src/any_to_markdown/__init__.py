@@ -10,17 +10,21 @@ except PackageNotFoundError:  # pragma: no cover - package not installed
 from .input_handler import MissingDependencyError, TranscriptUnavailableError
 from .main import (
     ConversionResult,
+    ConversionStatus,
     get_markdown,
     get_markdown_directory,
     handle_yt_local,
+    handle_yt_local_async,
 )
 
 __all__ = [
     "ConversionResult",
+    "ConversionStatus",
     "MissingDependencyError",
     "TranscriptUnavailableError",
     "get_markdown",
     "get_markdown_directory",
     "handle_yt_local",
+    "handle_yt_local_async",
     "__version__",
 ]

@@ -13,7 +13,7 @@ import tempfile
 import warnings
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Dict, Iterable, List, Optional
+from typing import Callable, Dict, Iterable, List, Literal, Optional
 from uuid import uuid4
 
 from . import input_handler
@@ -21,9 +21,15 @@ from .input_handler import TranscriptUnavailableError
 
 # --- Processing Constraints ---
 
-# Files larger than this will be processed sequentially to avoid Out-Of-Memory (OOM) errors.
-# This is especially important for heavy handlers like Whisper or OCR.
+# Concurrency threshold: files larger than this are processed sequentially
+# (one at a time) to avoid Out-Of-Memory errors. This is especially important
+# for heavy handlers like Whisper or OCR. It never rejects an input.
 MAX_PARALLEL_SIZE: int = 200 * 1024 * 1024  # 200MB
+
+# Hard cap for media downloaded by handle_yt_local: downloads larger than this
+# are rejected outright. Kept separate from MAX_PARALLEL_SIZE so tuning the
+# concurrency threshold never silently changes the download limit.
+MAX_DOWNLOAD_SIZE: int = 200 * 1024 * 1024  # 200MB
 
 # Number of concurrent tasks allowed for smaller files.
 MAX_CONCURRENT_TASKS: int = 10
@@ -75,12 +81,17 @@ HANDLERS: Dict[str, Callable[..., str]] = {
     ".yaml": input_handler.handle_code,
     ".yml": input_handler.handle_code,
     ".xml": input_handler.handle_code,
-    ".html": input_handler.handle_code,
+    ".html": input_handler.handle_html,
+    ".htm": input_handler.handle_html,
     ".css": input_handler.handle_code,
 }
 
 # Single source of truth: the supported extensions are exactly the handled ones.
 ALLOWED_EXTENSIONS: set[str] = set(HANDLERS)
+
+# Allowed conversion outcomes. Using a Literal lets mypy catch status typos
+# in both this package and downstream code.
+ConversionStatus = Literal["success", "error", "skipped"]
 
 
 @dataclass
@@ -102,7 +113,7 @@ class ConversionResult:
     """
 
     input: str
-    status: str
+    status: ConversionStatus
     content: Optional[str] = None
     output_path: Optional[Path] = None
     message: Optional[str] = None
@@ -115,10 +126,16 @@ class ConversionResult:
         return self.status == "success"
 
 
+_URL_PATTERN = re.compile(r"https?://[^\s'\"]+")
+_PATH_PATTERN = re.compile(r"(/[a-zA-Z0-9\._\-/]+)|([a-zA-Z]:\\[a-zA-Z0-9\._\-\\]+)")
+
+
 def _sanitize_error(error: BaseException) -> str:
     """Sanitizes error messages to prevent leaking system-specific info.
 
-    Replaces absolute paths with just the filename and limits message length.
+    Replaces absolute filesystem paths with just the filename and limits the
+    message length. URLs are preserved verbatim: the path portion of e.g. a
+    YouTube link is useful context, not a local filesystem leak.
 
     Args:
         error: The exception to sanitize.
@@ -128,8 +145,14 @@ def _sanitize_error(error: BaseException) -> str:
     """
     error_msg = str(error)
 
-    # Regex to identify potential absolute paths (Unix and Windows styles)
-    path_regex = r"(/[a-zA-Z0-9\._\-/]+)|([a-zA-Z]:\\[a-zA-Z0-9\._\-\\]+)"
+    # Protect URLs first so the filesystem-path regex cannot mangle them.
+    urls: List[str] = []
+
+    def stash_url(match: re.Match[str]) -> str:
+        urls.append(match.group(0))
+        return f"\x00URL{len(urls) - 1}\x00"
+
+    protected = _URL_PATTERN.sub(stash_url, error_msg)
 
     def mask_path(match: re.Match[str]) -> str:
         full_path = match.group(0)
@@ -141,7 +164,10 @@ def _sanitize_error(error: BaseException) -> str:
                 return "[REDACTED_PATH]"
         return full_path
 
-    sanitized = re.sub(path_regex, mask_path, error_msg)
+    sanitized = _PATH_PATTERN.sub(mask_path, protected)
+
+    for i, url in enumerate(urls):
+        sanitized = sanitized.replace(f"\x00URL{i}\x00", url)
 
     if len(sanitized) > 500:
         sanitized = sanitized[:497] + "..."
@@ -207,13 +233,22 @@ def _write_markdown(out_dir: Path, base_name: str, content: str) -> Path:
             counter += 1
 
 
-async def _process_input(input_val: str | Path, semaphore: asyncio.Semaphore, use_layout_engine: bool = False) -> str:
+async def _process_input(
+    input_val: str | Path,
+    semaphore: asyncio.Semaphore,
+    use_layout_engine: bool = False,
+    yt_id: Optional[str] = None,
+    whisper_model: Optional[str] = None,
+) -> str:
     """Internal wrapper to execute handlers for files or YouTube URLs.
 
     Args:
         input_val: The input file path or YouTube URL (validated upstream).
         semaphore: The concurrency gate to respect.
         use_layout_engine: Whether to use advanced PDF layout analysis.
+        yt_id: Pre-extracted YouTube video ID, or None for local files. The
+            ID is computed exactly once by the caller and carried through.
+        whisper_model: Optional Whisper model size for transcription jobs.
 
     Returns:
         The generated Markdown content.
@@ -224,10 +259,7 @@ async def _process_input(input_val: str | Path, semaphore: asyncio.Semaphore, us
             converted into a structured error result (the batch never aborts).
     """
     async with semaphore:
-        input_str = str(input_val)
-
-        # 1. Routing: Check if input is a YouTube URL
-        yt_id = input_handler.extract_youtube_id(input_str)
+        # 1. Routing: YouTube URLs (the ID was extracted once, upstream)
         if yt_id:
             metadata_header = f"\n---\nsource: YouTube\nid: {yt_id}\ntype: youtube\n---\n\n"
             content = await asyncio.to_thread(input_handler.handle_youtube, yt_id)
@@ -243,7 +275,10 @@ async def _process_input(input_val: str | Path, semaphore: asyncio.Semaphore, us
             return await asyncio.to_thread(handler, file_path, use_layout_engine)
 
         metadata_header = f"\n---\nsource: {file_path.name}\ntype: {ext.lstrip('.')}\n---\n\n"
-        content = await asyncio.to_thread(handler, file_path)
+        if ext in TRANSCRIPTION_EXTENSIONS:
+            content = await asyncio.to_thread(handler, file_path, whisper_model)
+        else:
+            content = await asyncio.to_thread(handler, file_path)
         return f"{metadata_header}{content}"
 
 
@@ -252,6 +287,7 @@ async def get_markdown(
     use_layout_engine: bool = False,
     max_transcriptions: int = 1,
     output_dir: str | Path | None = None,
+    whisper_model: Optional[str] = None,
 ) -> List[ConversionResult]:
     """The main conversion engine for a batch of files and YouTube URLs.
 
@@ -268,6 +304,9 @@ async def get_markdown(
             files. Defaults to './raw_data' in the current working directory.
             When provided, successful results also carry a human-readable
             success message.
+        whisper_model: Optional Whisper model size for audio/video inputs
+            (e.g. 'tiny', 'small', 'medium'). Defaults to the
+            ANY_TO_MARKDOWN_WHISPER_MODEL environment variable, or 'small'.
 
     Returns:
         One ConversionResult per input, in input order. Successful results
@@ -287,15 +326,19 @@ async def get_markdown(
     large_file_semaphore = asyncio.Semaphore(1)
     transcription_semaphore = asyncio.Semaphore(max_transcriptions)
 
+    # Extract every YouTube ID exactly once; reused for routing, processing,
+    # and output naming below.
+    yt_ids: List[Optional[str]] = [input_handler.extract_youtube_id(str(item)) for item in input_list]
+
     results: List[Optional[ConversionResult]] = [None] * len(input_list)
     tasks: List[Optional[asyncio.Task[str]]] = [None] * len(input_list)
 
     for i, item in enumerate(input_list):
         input_str = str(item)
-        yt_id = input_handler.extract_youtube_id(input_str)
+        yt_id = yt_ids[i]
 
         if yt_id:
-            tasks[i] = asyncio.create_task(_process_input(input_str, small_task_semaphore))
+            tasks[i] = asyncio.create_task(_process_input(input_str, small_task_semaphore, yt_id=yt_id))
             continue
 
         file_path = Path(item)
@@ -324,7 +367,9 @@ async def get_markdown(
         else:
             file_size = file_path.stat().st_size
             sem = small_task_semaphore if file_size <= MAX_PARALLEL_SIZE else large_file_semaphore
-        tasks[i] = asyncio.create_task(_process_input(file_path, sem, use_layout_engine))
+        tasks[i] = asyncio.create_task(
+            _process_input(file_path, sem, use_layout_engine, whisper_model=whisper_model)
+        )
 
     pending = [t for t in tasks if t is not None]
     if pending:
@@ -349,7 +394,7 @@ async def get_markdown(
             continue
 
         content = task.result()
-        yt_id = input_handler.extract_youtube_id(input_str)
+        yt_id = yt_ids[i]
         if yt_id:
             base_name = f"youtube_{yt_id}"
         else:
@@ -376,7 +421,8 @@ async def get_markdown_directory(
     use_layout_engine: bool = False,
     max_transcriptions: int = 1,
     output_dir: str | Path | None = None,
-) -> Optional[List[ConversionResult]]:
+    whisper_model: Optional[str] = None,
+) -> List[ConversionResult]:
     """Crawls a directory recursively and converts supported files.
 
     Args:
@@ -385,9 +431,11 @@ async def get_markdown_directory(
         max_transcriptions: Maximum number of concurrent Whisper transcription
             jobs for audio/video files.
         output_dir: Optional output directory (defaults to './raw_data').
+        whisper_model: Optional Whisper model size for audio/video inputs.
 
     Returns:
-        A list of ConversionResult objects, or None if no supported files found.
+        A list of ConversionResult objects; empty if the directory contains
+        no supported files.
 
     Raises:
         ValueError: If the provided path is not a valid directory.
@@ -404,7 +452,7 @@ async def get_markdown_directory(
                 file_list.append(file_path)
 
     if not file_list:
-        return None
+        return []
 
     file_list.sort()
     return await get_markdown(
@@ -412,61 +460,146 @@ async def get_markdown_directory(
         use_layout_engine=use_layout_engine,
         max_transcriptions=max_transcriptions,
         output_dir=output_dir,
+        whisper_model=whisper_model,
     )
 
 
-def handle_yt_local(urls: str | List[str]) -> List[ConversionResult]:
-    """Heavy-duty YouTube processor using Whisper transcription.
+def _download_and_transcribe(url: str, whisper_model: Optional[str]) -> str:
+    """Downloads the audio-only stream for a YouTube URL and transcribes it.
 
-    Downloads the audio-only stream (no video) and feeds it directly to the
-    Whisper engine. This means smaller downloads, no transcoding, and no
-    FFmpeg requirement for this path (faster-whisper accepts m4a/webm directly).
-
-    Unlike get_markdown, this function writes nothing to disk: the
-    transcription is returned in each result's `content` field.
+    Blocking helper, executed in a worker thread by handle_yt_local_async.
 
     Args:
-        urls: A single YouTube URL or a list of URLs.
+        url: The YouTube URL to download.
+        whisper_model: Optional Whisper model size.
 
     Returns:
-        One ConversionResult per URL, in input order.
+        The transcript text.
+
+    Raises:
+        ValueError: If the downloaded audio exceeds MAX_DOWNLOAD_SIZE.
+        Exception: Any yt-dlp or transcription error propagates to the caller.
     """
     yt_dlp = input_handler.require_dependency("yt_dlp", "youtube")
 
-    url_list = [urls] if isinstance(urls, str) else urls
-    results: List[ConversionResult] = []
+    out_tmpl = str(Path(tempfile.gettempdir()) / f"yt_{uuid4()}.%(ext)s")
+    ydl_opts = {
+        # Audio-only download: smaller transfer, no transcode, and no FFmpeg
+        # requirement, since faster-whisper accepts m4a/webm directly.
+        "format": "bestaudio[ext=m4a]/bestaudio/best",
+        "outtmpl": out_tmpl,
+        "quiet": True,
+        "no_warnings": True,
+    }
 
-    for url in url_list:
-        temp_dir = tempfile.gettempdir()
-        out_tmpl = str(Path(temp_dir) / f"yt_{uuid4()}.%(ext)s")
+    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        info = ydl.extract_info(url, download=True)
+        downloaded_file = ydl.prepare_filename(info)
 
-        ydl_opts = {
-            # Audio-only download: smaller transfer, no transcode, and no FFmpeg
-            # requirement, since faster-whisper accepts m4a/webm directly.
-            "format": "bestaudio[ext=m4a]/bestaudio/best",
-            "outtmpl": out_tmpl,
-            "quiet": True,
-            "no_warnings": True,
-        }
+    path = Path(downloaded_file)
+    try:
+        if path.stat().st_size > MAX_DOWNLOAD_SIZE:
+            raise ValueError("file is too large to process")
 
-        try:
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                info = ydl.extract_info(url, download=True)
-                downloaded_file = ydl.prepare_filename(info)
+        # Feed the audio file straight to Whisper; skip handle_video's
+        # ffmpeg-based audio extraction entirely.
+        return input_handler.handle_audio(downloaded_file, whisper_model)
+    finally:
+        # Guarantee cleanup of the downloaded media file.
+        path.unlink(missing_ok=True)
 
-            path = Path(downloaded_file)
-            if path.stat().st_size > MAX_PARALLEL_SIZE:
-                path.unlink(missing_ok=True)
-                raise ValueError("file is too large to process")
 
-            # Feed the audio file straight to Whisper; skip handle_video's
-            # ffmpeg-based audio extraction entirely.
-            transcription = input_handler.handle_audio(downloaded_file)
-            path.unlink(missing_ok=True)
-            results.append(ConversionResult(input=url, status="success", content=transcription))
+async def handle_yt_local_async(
+    urls: str | List[str],
+    max_transcriptions: int = 1,
+    output_dir: str | Path | None = None,
+    whisper_model: Optional[str] = None,
+) -> List[ConversionResult]:
+    """Heavy-duty YouTube processor using Whisper transcription (async).
 
-        except Exception as e:
-            results.append(ConversionResult(input=url, status="error", error=_sanitize_error(e)))
+    Downloads the audio-only stream (no video) and feeds it directly to the
+    Whisper engine. This means smaller downloads, no transcoding, and no
+    FFmpeg requirement for this path (faster-whisper accepts m4a/webm
+    directly). URLs are processed concurrently, but transcription jobs are
+    gated by a semaphore (one at a time by default).
 
+    Args:
+        urls: A single YouTube URL or a list of URLs.
+        max_transcriptions: Maximum number of concurrent transcription jobs.
+        output_dir: Optional output directory. When provided, each successful
+            transcription is also written to 'youtube_<video_id>.md' via the
+            collision-safe writer, and the result carries output_path plus a
+            human-readable message. When omitted, nothing is written to disk.
+        whisper_model: Optional Whisper model size (see get_whisper_model).
+
+    Returns:
+        One ConversionResult per URL, in input order. The transcription is
+        always available in each successful result's `content` field.
+
+    Raises:
+        MissingDependencyError: If the 'youtube' extra is not installed.
+    """
+    # Fail fast with an actionable message before doing any work.
+    input_handler.require_dependency("yt_dlp", "youtube")
+
+    url_list = [urls] if isinstance(urls, str) else list(urls)
+    out_dir = Path(output_dir) if output_dir is not None else None
+    semaphore = asyncio.Semaphore(max_transcriptions)
+
+    async def process(url: str) -> ConversionResult:
+        async with semaphore:
+            try:
+                transcription = await asyncio.to_thread(_download_and_transcribe, url, whisper_model)
+            except Exception as e:
+                return ConversionResult(input=url, status="error", error=_sanitize_error(e))
+
+        result = ConversionResult(input=url, status="success", content=transcription)
+        if out_dir is not None:
+            video_id = input_handler.extract_youtube_id(url) or "video"
+            out_path = _write_markdown(out_dir, f"youtube_{video_id}", transcription)
+            result.output_path = out_path
+            result.message = f"Success: '{url}' converted and written to '{out_path}'"
+        return result
+
+    results = list(await asyncio.gather(*(process(url) for url in url_list)))
     _warn_about_failures(results)
     return results
+
+
+def handle_yt_local(
+    urls: str | List[str],
+    max_transcriptions: int = 1,
+    output_dir: str | Path | None = None,
+    whisper_model: Optional[str] = None,
+) -> List[ConversionResult]:
+    """Synchronous wrapper around handle_yt_local_async.
+
+    Keeps the original blocking call signature working. From async code,
+    await handle_yt_local_async() directly instead.
+
+    Args:
+        urls: A single YouTube URL or a list of URLs.
+        max_transcriptions: Maximum number of concurrent transcription jobs.
+        output_dir: Optional output directory (see handle_yt_local_async).
+        whisper_model: Optional Whisper model size (see get_whisper_model).
+
+    Returns:
+        One ConversionResult per URL, in input order.
+
+    Raises:
+        RuntimeError: If called from a running event loop.
+    """
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return asyncio.run(
+            handle_yt_local_async(
+                urls,
+                max_transcriptions=max_transcriptions,
+                output_dir=output_dir,
+                whisper_model=whisper_model,
+            )
+        )
+    raise RuntimeError(
+        "handle_yt_local() cannot be called from a running event loop; await handle_yt_local_async() instead."
+    )
