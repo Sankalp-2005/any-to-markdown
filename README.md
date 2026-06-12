@@ -11,22 +11,24 @@ It is designed for documentation pipelines, retrieval-augmented generation (RAG)
 
 ## Key Features
 
-- **Broad File Support:** Converts PDF, DOCX, PPTX, XLSX, Jupyter Notebooks (.ipynb), Images (OCR), Audio/Video (Transcription), and virtually any source code file.
-- **Advanced PDF Engine:** Built-in AI-powered layout analysis to remove "noise" (headers, footers, page numbers) and accurately extract tables.
-- **YouTube Integration:** Fetches transcripts directly via API or transcribes video locally using Whisper.
-- **Smart Concurrency:** Automatically manages resource usage, processing large files sequentially and small files in parallel.
+- **Broad File Support:** Converts PDF, DOCX, PPTX, XLSX, Jupyter Notebooks (.ipynb), Images (OCR), Audio/Video (Transcription), and many source code file types.
+- **Optional PDF Layout Mode:** Layout analysis via `pymupdf4llm` heuristics (table detection and structure-aware Markdown). The default PDF engine uses PyMuPDF with font-size and bold-flag heuristics, plus an OCR fallback for image-heavy pages.
+- **YouTube Integration:** Fetches transcripts directly via the YouTube transcript API, or transcribes locally with Whisper via `handle_yt_local` (audio-only download, no FFmpeg required).
+- **Honest Concurrency:** Small files run in parallel, files over 200MB run sequentially, and Whisper transcription jobs are limited to one at a time by default (see Concurrency Model below).
 - **Secure & Private:** Sanitizes error messages to prevent leaking system paths and sensitive information.
 - **No Overwrites:** Saves results to a `raw_data/` directory with collision-resistant naming.
 
 ## Supported Formats
 
+This list matches the code's `ALLOWED_EXTENSIONS` exactly:
+
 - **Documents:** `.pdf`, `.docx`, `.pptx`, `.txt`, `.md`
-- **Jupyter Notebooks:** `.ipynb` (Extracts Markdown and Code cells)
-- **Source Code:** `.py`, `.js`, `.ts`, `.cpp`, `.c`, `.rs`, `.go`, `.java`, `.rb`, `.php`, `.sh`, `.sql`, `.html`, `.css`, `.yaml`, `.json`, `.xml`, etc.
+- **Jupyter Notebooks:** `.ipynb` (extracts Markdown and code cells)
+- **Source Code & Markup:** `.py`, `.js`, `.ts`, `.cpp`, `.c`, `.h`, `.hpp`, `.rs`, `.go`, `.java`, `.rb`, `.php`, `.sh`, `.sql`, `.yaml`, `.yml`, `.json`, `.xml`, `.html`, `.css`
 - **Data:** `.xlsx`, `.xls`, `.csv`
-- **Images:** `.png`, `.jpg`, `.jpeg`, `.tiff`, `.bmp` (via OCR)
-- **Multimedia:** `.mp3`, `.mp4`, `.m4a`, `.wav` (via Transcription)
-- **Web:** YouTube URLs (Transcripts)
+- **Images (OCR):** `.png`, `.jpg`, `.jpeg`, `.tiff`, `.tif`, `.bmp`
+- **Multimedia (Transcription):** `.mp3`, `.wav`, `.m4a`, `.mp4`
+- **Web:** YouTube URLs (transcripts)
 
 ## Installation
 
@@ -34,12 +36,12 @@ It is designed for documentation pipelines, retrieval-augmented generation (RAG)
 pip install any-to-markdown
 ```
 
+All Python dependencies, including `pymupdf4llm` for the optional layout mode, are installed by default. There are currently no optional extras.
+
 ### External Dependencies
 
-For full functionality, ensure the following are installed on your system:
-
-- **FFmpeg:** Required for audio/video processing and local YouTube transcription.
-- **Tesseract OCR:** Required for image OCR and PDF visual fallback.
+- **Tesseract OCR:** Required for image OCR and the PDF visual fallback.
+- **FFmpeg:** Required only for local video files (`.mp4`), where the audio track is extracted before transcription. It is **not** required for `handle_yt_local`, which downloads an audio-only stream and feeds it directly to Whisper.
 
 ---
 
@@ -47,17 +49,19 @@ For full functionality, ensure the following are installed on your system:
 
 The package exports the following helpers from `any_to_markdown`:
 
-- `get_markdown(inputs, use_layout_engine=False)`
-- `get_markdown_directory(directory_path, use_layout_engine=False)`
+- `get_markdown(inputs, use_layout_engine=False, max_transcriptions=1)`
+- `get_markdown_directory(directory_path, use_layout_engine=False, max_transcriptions=1)`
 - `handle_yt_local(urls)`
 
-### Advanced PDF Layout
+### PDF Layout Mode
 
-For significantly better PDF conversion (smart table detection, header/footer removal), enable the advanced layout engine:
+For PDFs with complex tables, enable the `pymupdf4llm`-based layout analysis:
 
 ```python
 results = await get_markdown("input.pdf", use_layout_engine=True)
 ```
+
+This mode is heuristic-based (not AI-powered): it relies on `pymupdf4llm`'s rules for detecting tables, headings, and document structure.
 
 ---
 
@@ -102,7 +106,7 @@ if __name__ == "__main__":
 
 ### Transcribe YouTube videos locally
 
-Use `handle_yt_local()` when a YouTube transcript is unavailable or disabled. This downloads the audio and transcribes it locally using Whisper.
+Use `handle_yt_local()` when a YouTube transcript is unavailable or disabled. It downloads the **audio-only** stream (`bestaudio[ext=m4a]/bestaudio/best`) and transcribes it locally with Whisper. No FFmpeg is needed for this path.
 
 ```python
 from any_to_markdown import handle_yt_local
@@ -116,17 +120,24 @@ print(outputs[0]) # Returns the raw markdown string
 
 ## Output Behavior
 
-Generated Markdown files are written to a `./raw_data/` directory in the current working directory.
+`get_markdown` and `get_markdown_directory` always **write Markdown files to disk** and return the list of generated file paths. They do not return the Markdown content itself, and there is currently no `output_dir` parameter: files are written to a `./raw_data/` directory in the current working directory (created automatically).
 
 - **Local Files:** `<filename>_<extension>.md` (e.g., `data.csv` -> `data_csv.md`)
 - **YouTube:** `youtube_<video_id>.md`
 - **Collisions:** If a file exists, a numeric suffix is added (e.g., `report_pdf_1.md`).
 
+`handle_yt_local` is the exception: it returns the Markdown transcription strings directly and writes nothing to disk.
+
 ---
+
+## Concurrency Model
+
+- Up to **10** small files are processed concurrently.
+- Files larger than **200MB** are processed sequentially (one at a time) to avoid out-of-memory errors.
+- Audio and video files (`.mp3`, `.wav`, `.m4a`, `.mp4`) are always routed through a dedicated transcription semaphore so that only **one Whisper job** runs at a time by default, regardless of file size. Tune this with the `max_transcriptions` parameter.
 
 ## Troubleshooting & Tips
 
-- **Large Files:** Files > 200MB are automatically processed sequentially to prevent memory issues.
 - **OCR Quality:** Depends on your local Tesseract installation and image resolution.
 - **Whisper Performance:** On the first run, the Whisper model will be downloaded (cached locally). CPU performance is optimized using `int8` quantization.
 - **Privacy:** Errors caught during processing are sanitized to remove absolute local paths before being written to Markdown.
