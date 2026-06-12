@@ -183,6 +183,7 @@ if results[0].ok:
 
 - **OCR Quality:** Depends on your local Tesseract installation and image resolution.
 - **Whisper Performance:** On the first run, the Whisper model will be downloaded (cached locally). CPU performance is optimized using `int8` quantization.
+- **Privacy:** Error messages are sanitized to remove absolute local paths before being surfaced.
 
 ## License
 
