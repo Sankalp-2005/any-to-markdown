@@ -1,7 +1,7 @@
 """Module for handling various input types and converting them to Markdown.
 
 Supports text, documents, spreadsheets, presentations, images (OCR),
-PDFs (with table detection), audio, video, and YouTube transcripts.
+PDFs (with table detection), HTML, audio, video, and YouTube transcripts.
 
 Heavy optional dependencies (PyMuPDF, Tesseract/Pillow, faster-whisper,
 youtube-transcript-api, yt-dlp) are imported lazily so that the core package
@@ -11,11 +11,13 @@ stays importable and lightweight without the corresponding extras.
 from __future__ import annotations
 
 import importlib
+import os
 import re
 import subprocess
 import tempfile
 import threading
 import warnings
+from html.parser import HTMLParser
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 from uuid import uuid4
@@ -35,9 +37,15 @@ if TYPE_CHECKING:
 # PyMuPDF span flag bits: bit 1 (value 2) is italic, bit 4 (value 16) is bold.
 _BOLD_FLAG: int = 1 << 4
 
-# Global model instance for Faster-Whisper to avoid reloading for every file
-# Initialized lazily to save resources if no audio/video files are processed
-_whisper_model: Optional[WhisperModel] = None
+# Default Whisper model size; can be overridden per call or via the
+# ANY_TO_MARKDOWN_WHISPER_MODEL environment variable.
+_DEFAULT_WHISPER_MODEL: str = "small"
+_WHISPER_MODEL_ENV_VAR: str = "ANY_TO_MARKDOWN_WHISPER_MODEL"
+
+# Cache of Faster-Whisper model instances keyed by model size, so switching
+# sizes never silently reuses the wrong model. Initialized lazily to save
+# resources if no audio/video files are processed.
+_whisper_models: Dict[str, "WhisperModel"] = {}
 _model_lock = threading.Lock()
 
 
@@ -72,23 +80,31 @@ def require_dependency(module_name: str, extra: str) -> Any:
         ) from e
 
 
-def get_whisper_model() -> WhisperModel:
-    """Lazily initializes and returns the Faster-Whisper model.
+def get_whisper_model(model_size: Optional[str] = None) -> WhisperModel:
+    """Lazily initializes and returns a Faster-Whisper model.
 
     Architectural Decision:
     - Lazy initialization ensures we don't consume memory/GPU resources until needed.
-    - Thread-safety is ensured via a global lock.
+    - Instances are cached per model size and guarded by a global lock, so
+      switching sizes never reuses the wrong model.
     - Uses GPU (CUDA) if available, otherwise falls back to CPU with int8 quantization.
 
+    Args:
+        model_size: Whisper model size (e.g. 'tiny', 'small', 'medium',
+            'large-v3'). Defaults to the ANY_TO_MARKDOWN_WHISPER_MODEL
+            environment variable, or 'small' if unset.
+
     Returns:
-         WhisperModel: An initialized instance of the Faster-Whisper model.
+        WhisperModel: An initialized instance of the Faster-Whisper model.
 
     Raises:
         MissingDependencyError: If the 'audio' extra is not installed.
     """
-    global _whisper_model
+    if model_size is None:
+        model_size = os.environ.get(_WHISPER_MODEL_ENV_VAR, _DEFAULT_WHISPER_MODEL)
+
     with _model_lock:
-        if _whisper_model is None:
+        if model_size not in _whisper_models:
             ctranslate2 = require_dependency("ctranslate2", "audio")
             faster_whisper = require_dependency("faster_whisper", "audio")
 
@@ -99,13 +115,18 @@ def get_whisper_model() -> WhisperModel:
             # while int8 is highly optimized for modern CPUs via ctranslate2.
             compute_type = "float16" if device == "cuda" else "int8"
 
-            # Using 'small' model as a balance between speed and accuracy
-            _whisper_model = faster_whisper.WhisperModel("small", device=device, compute_type=compute_type)
-    return _whisper_model
+            _whisper_models[model_size] = faster_whisper.WhisperModel(
+                model_size, device=device, compute_type=compute_type
+            )
+        return _whisper_models[model_size]
 
 
 def handle_text(file_path: str | Path) -> str:
-    """Reads plain text files (UTF-8) and returns content.
+    """Reads plain text files with tolerant decoding and returns content.
+
+    Decoding strategy: UTF-8 (BOM-aware via utf-8-sig) first, then Latin-1 as
+    a fallback, so a single odd byte never fails the whole file. Latin-1 maps
+    every byte to a code point, making the fallback lossless and total.
 
     Args:
         file_path: Path to the source text file.
@@ -113,9 +134,11 @@ def handle_text(file_path: str | Path) -> str:
     Returns:
         The file content wrapped in Markdown-friendly spacing.
     """
-    path = Path(file_path)
-    with path.open("r", encoding="utf-8") as user_file:
-        user_data = user_file.read()
+    raw = Path(file_path).read_bytes()
+    try:
+        user_data = raw.decode("utf-8-sig")
+    except UnicodeDecodeError:
+        user_data = raw.decode("latin-1")
     return f"\n\n{user_data}\n\n"
 
 
@@ -449,11 +472,193 @@ def handle_code(file_path: str | Path) -> str:
     return f"```{lang}\n{content}\n```\n\n"
 
 
-def handle_audio(file_path: str | Path) -> str:
+class _MarkdownHTMLParser(HTMLParser):
+    """Converts a practical subset of HTML into Markdown.
+
+    Supported: headings, paragraphs, line breaks, bold/italic, inline code,
+    pre blocks, blockquotes, links, nested ordered/unordered lists, tables,
+    and horizontal rules. Non-content tags (script, style, head, ...) are
+    stripped entirely. Unknown tags degrade gracefully to their text content.
+    """
+
+    _SKIPPED_TAGS = {"script", "style", "head", "title", "meta", "link", "noscript"}
+    _HEADING_PREFIXES = {"h1": "#", "h2": "##", "h3": "###", "h4": "####", "h5": "#####", "h6": "######"}
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self._parts: List[str] = []
+        self._skip_depth = 0
+        self._in_pre = False
+        self._list_stack: List[str] = []
+        self._ol_counters: List[int] = []
+        self._href: Optional[str] = None
+        self._link_text: List[str] = []
+        self._table_rows: Optional[List[List[str]]] = None
+        self._current_row: Optional[List[str]] = None
+        self._current_cell: Optional[List[str]] = None
+
+    def get_markdown(self) -> str:
+        """Returns the accumulated Markdown with normalized blank lines."""
+        text = "".join(self._parts)
+        return re.sub(r"\n{3,}", "\n\n", text).strip()
+
+    def _emit(self, text: str) -> None:
+        """Routes text to the innermost active sink (link, table cell, or body)."""
+        if self._href is not None:
+            self._link_text.append(text)
+        elif self._current_cell is not None:
+            self._current_cell.append(text)
+        else:
+            self._parts.append(text)
+
+    def _emit_block(self, text: str) -> None:
+        """Emits text to the current cell or the body, bypassing the link sink."""
+        if self._current_cell is not None:
+            self._current_cell.append(text)
+        else:
+            self._parts.append(text)
+
+    def handle_starttag(self, tag: str, attrs: List[Tuple[str, Optional[str]]]) -> None:
+        if tag in self._SKIPPED_TAGS:
+            self._skip_depth += 1
+            return
+        if self._skip_depth:
+            return
+
+        if tag in self._HEADING_PREFIXES:
+            self._emit(f"\n\n{self._HEADING_PREFIXES[tag]} ")
+        elif tag == "p":
+            self._emit("\n\n")
+        elif tag == "br":
+            self._emit("  \n")
+        elif tag == "hr":
+            self._emit("\n\n---\n\n")
+        elif tag in ("strong", "b"):
+            self._emit("**")
+        elif tag in ("em", "i"):
+            self._emit("*")
+        elif tag == "code" and not self._in_pre:
+            self._emit("`")
+        elif tag == "pre":
+            self._in_pre = True
+            self._emit("\n\n```\n")
+        elif tag == "blockquote":
+            self._emit("\n\n> ")
+        elif tag in ("ul", "ol"):
+            self._list_stack.append(tag)
+            self._ol_counters.append(0)
+        elif tag == "li":
+            indent = "  " * max(len(self._list_stack) - 1, 0)
+            if self._list_stack and self._list_stack[-1] == "ol":
+                self._ol_counters[-1] += 1
+                self._emit(f"\n{indent}{self._ol_counters[-1]}. ")
+            else:
+                self._emit(f"\n{indent}- ")
+        elif tag == "a":
+            self._href = next((value or "" for name, value in attrs if name == "href"), "")
+            self._link_text = []
+        elif tag == "table":
+            self._table_rows = []
+        elif tag == "tr" and self._table_rows is not None:
+            self._current_row = []
+        elif tag in ("td", "th") and self._current_row is not None:
+            self._current_cell = []
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag in self._SKIPPED_TAGS:
+            self._skip_depth = max(self._skip_depth - 1, 0)
+            return
+        if self._skip_depth:
+            return
+
+        if tag in self._HEADING_PREFIXES or tag in ("p", "blockquote"):
+            self._emit("\n\n")
+        elif tag in ("strong", "b"):
+            self._emit("**")
+        elif tag in ("em", "i"):
+            self._emit("*")
+        elif tag == "code" and not self._in_pre:
+            self._emit("`")
+        elif tag == "pre":
+            self._in_pre = False
+            self._emit("\n```\n\n")
+        elif tag in ("ul", "ol"):
+            if self._list_stack:
+                self._list_stack.pop()
+                self._ol_counters.pop()
+            self._emit("\n\n")
+        elif tag == "a" and self._href is not None:
+            text = "".join(self._link_text).strip()
+            href = self._href
+            self._href = None
+            self._emit_block(f"[{text}]({href})" if text else "")
+        elif tag in ("td", "th") and self._current_cell is not None and self._current_row is not None:
+            self._current_row.append("".join(self._current_cell).strip().replace("|", "\\|"))
+            self._current_cell = None
+        elif tag == "tr" and self._current_row is not None and self._table_rows is not None:
+            self._table_rows.append(self._current_row)
+            self._current_row = None
+        elif tag == "table":
+            self._flush_table()
+
+    def handle_data(self, data: str) -> None:
+        if self._skip_depth:
+            return
+        if self._in_pre:
+            self._emit(data)
+            return
+        collapsed = re.sub(r"[ \t\r\n]+", " ", data)
+        if collapsed.strip():
+            self._emit(collapsed)
+
+    def _flush_table(self) -> None:
+        rows = [row for row in (self._table_rows or []) if row]
+        self._table_rows = None
+        if not rows:
+            return
+        width = max(len(row) for row in rows)
+        padded = [row + [""] * (width - len(row)) for row in rows]
+        lines = [
+            "| " + " | ".join(padded[0]) + " |",
+            "| " + " | ".join(["---"] * width) + " |",
+        ]
+        lines.extend("| " + " | ".join(row) + " |" for row in padded[1:])
+        self._emit_block("\n\n" + "\n".join(lines) + "\n\n")
+
+
+def handle_html(file_path: str | Path) -> str:
+    """Converts HTML files into structured Markdown.
+
+    Uses a stdlib html.parser-based converter (no extra dependency) that maps
+    headings, paragraphs, emphasis, links, lists, tables, code/pre blocks, and
+    blockquotes to their Markdown equivalents. Script and style content is
+    stripped. Decoding follows the same tolerant strategy as handle_text.
+
+    Args:
+        file_path: Path to the .html/.htm file.
+
+    Returns:
+        The converted Markdown content.
+    """
+    raw = Path(file_path).read_bytes()
+    try:
+        html = raw.decode("utf-8-sig")
+    except UnicodeDecodeError:
+        html = raw.decode("latin-1")
+
+    parser = _MarkdownHTMLParser()
+    parser.feed(html)
+    parser.close()
+    return f"{parser.get_markdown()}\n\n"
+
+
+def handle_audio(file_path: str | Path, whisper_model: Optional[str] = None) -> str:
     """Transcribes audio files using the local Faster-Whisper engine.
 
     Args:
         file_path: Path to the audio file.
+        whisper_model: Optional Whisper model size (e.g. 'tiny', 'small',
+            'medium'). See get_whisper_model for default resolution.
 
     Returns:
         The generated transcript text.
@@ -461,17 +666,18 @@ def handle_audio(file_path: str | Path) -> str:
     Raises:
         MissingDependencyError: If the 'audio' extra is not installed.
     """
-    whisper_model = get_whisper_model()
+    model = get_whisper_model(whisper_model)
     # segments is a generator; we consume it to get the full transcript
-    segments, _ = whisper_model.transcribe(str(file_path), vad_filter=True)
+    segments, _ = model.transcribe(str(file_path), vad_filter=True)
     return "".join(segment.text + "\n" for segment in segments)
 
 
-def handle_video(file_path: str | Path) -> str:
+def handle_video(file_path: str | Path, whisper_model: Optional[str] = None) -> str:
     """Processes video files by extracting the audio stream and transcribing it.
 
     Args:
         file_path: Path to the video file.
+        whisper_model: Optional Whisper model size (see get_whisper_model).
 
     Returns:
         The generated transcript text extracted from the video's audio.
@@ -512,7 +718,7 @@ def handle_video(file_path: str | Path) -> str:
             stderr_tail = (proc.stderr or "").strip()[-500:]
             raise RuntimeError(f"ffmpeg failed with exit code {proc.returncode}: {stderr_tail}")
 
-        return handle_audio(audio_path)
+        return handle_audio(audio_path, whisper_model)
     finally:
         # Guarantee cleanup of the heavy audio file
         audio_path.unlink(missing_ok=True)
@@ -574,3 +780,4 @@ def handle_youtube(video_id_or_url: str) -> str:
             f"No transcript available for YouTube video {video_id}: {e}. "
             "Use handle_yt_local() to transcribe it locally instead."
         ) from e
+
