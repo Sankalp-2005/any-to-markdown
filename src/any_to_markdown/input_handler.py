@@ -11,7 +11,7 @@ import subprocess
 import tempfile
 import threading
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
 from uuid import uuid4
 
 import fitz  # PyMuPDF
@@ -28,6 +28,9 @@ from youtube_transcript_api import YouTubeTranscriptApi
 
 if TYPE_CHECKING:
     from faster_whisper import WhisperModel
+
+# PyMuPDF span flag bits: bit 1 (value 2) is italic, bit 4 (value 16) is bold.
+_BOLD_FLAG: int = 1 << 4
 
 # Global model instance for Faster-Whisper to avoid reloading for every file
 # Initialized lazily to save resources if no audio/video files are processed
@@ -136,6 +139,19 @@ def handle_excel(file_path: str | Path) -> str:
     return "".join(parts)
 
 
+def handle_csv(file_path: str | Path) -> str:
+    """Processes CSV files into a Markdown table.
+
+    Args:
+        file_path: Path to the .csv file.
+
+    Returns:
+        The CSV content converted into a Markdown table.
+    """
+    df = pd.read_csv(file_path)
+    return f"{df.to_markdown(index=False)}\n\n"
+
+
 def handle_powerpoint(file_path: str | Path) -> str:
     """Processes PowerPoint files, extracting text slide by slide.
 
@@ -235,7 +251,7 @@ def _get_pdf_items(page: fitz.Page, ignore_bboxes: Optional[List[fitz.Rect]] = N
                         structured_parts.append(f"\n# {text}\n")
                     elif size > 13:
                         structured_parts.append(f"\n## {text}\n")
-                    elif flags & 2:  # bold flag bit in PyMuPDF
+                    elif flags & _BOLD_FLAG:  # bold flag bit in PyMuPDF (bit 4 = 16)
                         structured_parts.append(f"\n### {text}\n")
                     else:
                         structured_parts.append(text + " ")
@@ -464,8 +480,10 @@ def handle_youtube(video_id_or_url: str) -> str:
             # Priority 2: Any available language
             transcript = next(iter(transcript_list))
 
-        data: List[Dict[str, Any]] = transcript.fetch()
-        text = " ".join(chunk["text"] for chunk in data)
+        # youtube-transcript-api >= 1.x returns FetchedTranscriptSnippet objects,
+        # which expose text via an attribute rather than dict access.
+        data = transcript.fetch()
+        text = " ".join(chunk.text for chunk in data)
         return f"\n\n{text}\n\n"
 
     except Exception as e:
