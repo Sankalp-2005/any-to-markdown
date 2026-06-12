@@ -15,7 +15,7 @@ cache:
 default:
   before_script:
     - pip install uv
-    - uv sync --all-groups
+    - uv sync --all-extras --all-groups
 
 ruff:
   stage: lint
