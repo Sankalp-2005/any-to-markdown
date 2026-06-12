@@ -10,9 +10,7 @@ import pytest
 from any_to_markdown import input_handler, main
 
 
-def test_get_markdown_missing_file_returns_error_result(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_get_markdown_missing_file_returns_error_result(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.chdir(tmp_path)
 
     with pytest.warns(UserWarning, match="File not found"):
@@ -27,9 +25,7 @@ def test_get_markdown_missing_file_returns_error_result(
     assert result.content is None
 
 
-def test_get_markdown_youtube_with_mocked_transcript(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_get_markdown_youtube_with_mocked_transcript(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.chdir(tmp_path)
 
     def fake_handle_youtube(video_id: str) -> str:
@@ -68,9 +64,7 @@ def test_get_markdown_custom_output_dir_returns_success_message(
     assert not (tmp_path / "raw_data").exists()
 
 
-def test_one_failure_never_kills_the_batch(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_one_failure_never_kills_the_batch(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.chdir(tmp_path)
     good = tmp_path / "good.txt"
     good.write_text("fine content", encoding="utf-8")
@@ -82,9 +76,7 @@ def test_one_failure_never_kills_the_batch(
     assert results[0].output_path is not None and results[0].output_path.exists()
 
 
-def test_unsupported_extension_is_skipped(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_unsupported_extension_is_skipped(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.chdir(tmp_path)
     weird = tmp_path / "data.xyz"
     weird.write_text("?", encoding="utf-8")

@@ -367,9 +367,7 @@ async def get_markdown(
         else:
             file_size = file_path.stat().st_size
             sem = small_task_semaphore if file_size <= MAX_PARALLEL_SIZE else large_file_semaphore
-        tasks[i] = asyncio.create_task(
-            _process_input(file_path, sem, use_layout_engine, whisper_model=whisper_model)
-        )
+        tasks[i] = asyncio.create_task(_process_input(file_path, sem, use_layout_engine, whisper_model=whisper_model))
 
     pending = [t for t in tasks if t is not None]
     if pending:
