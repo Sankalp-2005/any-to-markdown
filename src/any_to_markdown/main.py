@@ -1,6 +1,7 @@
 """Main orchestration module for the any-to-markdown processing engine.
 
-Handles concurrency, input routing (files vs. URLs), and batch directory processing.
+Handles concurrency, input routing (files vs. URLs), structured results,
+and batch directory processing.
 """
 
 from __future__ import annotations
@@ -9,13 +10,14 @@ import asyncio
 import os
 import re
 import tempfile
+import warnings
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Dict, Iterable, List, Optional
 from uuid import uuid4
 
-import yt_dlp
-
 from . import input_handler
+from .input_handler import TranscriptUnavailableError
 
 # --- Processing Constraints ---
 
@@ -31,48 +33,8 @@ MAX_CONCURRENT_TASKS: int = 10
 # concurrently, regardless of file size.
 TRANSCRIPTION_EXTENSIONS: set[str] = {".mp3", ".mp4", ".wav", ".m4a"}
 
-# Globally recognized file extensions for the processing pipeline.
-ALLOWED_EXTENSIONS: set[str] = {
-    ".txt",
-    ".json",
-    ".md",
-    ".docx",
-    ".xls",
-    ".xlsx",
-    ".csv",
-    ".pptx",
-    ".pdf",
-    ".png",
-    ".jpeg",
-    ".jpg",
-    ".tiff",
-    ".tif",
-    ".bmp",
-    ".mp3",
-    ".wav",
-    ".m4a",
-    ".mp4",
-    ".ipynb",
-    ".py",
-    ".js",
-    ".ts",
-    ".cpp",
-    ".c",
-    ".h",
-    ".hpp",
-    ".rs",
-    ".go",
-    ".java",
-    ".rb",
-    ".php",
-    ".sh",
-    ".sql",
-    ".yaml",
-    ".yml",
-    ".xml",
-    ".html",
-    ".css",
-}
+# Default output directory name (created in the current working directory).
+DEFAULT_OUTPUT_DIR: str = "raw_data"
 
 # Mapping of file extensions to their respective processing functions in input_handler.
 HANDLERS: Dict[str, Callable[..., str]] = {
@@ -117,8 +79,43 @@ HANDLERS: Dict[str, Callable[..., str]] = {
     ".css": input_handler.handle_code,
 }
 
+# Single source of truth: the supported extensions are exactly the handled ones.
+ALLOWED_EXTENSIONS: set[str] = set(HANDLERS)
 
-def _sanitize_error(error: Exception) -> str:
+
+@dataclass
+class ConversionResult:
+    """Structured outcome of a single input conversion.
+
+    Attributes:
+        input: The original input (file path or URL) as provided by the caller.
+        status: One of "success", "error", or "skipped".
+        content: The generated Markdown content (populated on success).
+        output_path: Path to the written Markdown file (populated on success
+            for functions that write to disk).
+        message: Human-readable success message (populated when the caller
+            explicitly specified an output_dir).
+        error: Sanitized, machine-readable error description (populated on
+            failure).
+        suggestion: Name of a suggested alternative function for failed
+            inputs (e.g. "handle_yt_local").
+    """
+
+    input: str
+    status: str
+    content: Optional[str] = None
+    output_path: Optional[Path] = None
+    message: Optional[str] = None
+    error: Optional[str] = None
+    suggestion: Optional[str] = None
+
+    @property
+    def ok(self) -> bool:
+        """True when the conversion succeeded."""
+        return self.status == "success"
+
+
+def _sanitize_error(error: BaseException) -> str:
     """Sanitizes error messages to prevent leaking system-specific info.
 
     Replaces absolute paths with just the filename and limits message length.
@@ -152,11 +149,69 @@ def _sanitize_error(error: Exception) -> str:
     return sanitized
 
 
+def _warn_about_failures(results: List[ConversionResult]) -> None:
+    """Emits warnings for failed/skipped inputs plus a batch summary.
+
+    Args:
+        results: The structured results of a batch run.
+    """
+    failed = [r for r in results if r.status == "error"]
+    skipped = [r for r in results if r.status == "skipped"]
+    if not failed and not skipped:
+        return
+
+    succeeded = len(results) - len(failed) - len(skipped)
+
+    for result in failed:
+        msg = f"Failed to convert '{result.input}': {result.error}"
+        if result.suggestion:
+            msg += f" Suggested alternative: {result.suggestion}()."
+        warnings.warn(msg, UserWarning, stacklevel=2)
+
+    for result in skipped:
+        warnings.warn(f"Skipped '{result.input}': {result.error}", UserWarning, stacklevel=2)
+
+    warnings.warn(
+        f"Batch summary: {succeeded} succeeded, {len(failed)} failed, "
+        f"{len(skipped)} skipped (out of {len(results)} inputs). "
+        "See the warnings above for per-input details and suggested alternatives.",
+        UserWarning,
+        stacklevel=2,
+    )
+
+
+def _write_markdown(out_dir: Path, base_name: str, content: str) -> Path:
+    """Writes content to a collision-resistant Markdown file.
+
+    Uses exclusive-create mode ("x") so that two concurrent runs can never
+    clobber each other's output (avoids the check-then-open TOCTOU race).
+
+    Args:
+        out_dir: Target directory (created if missing).
+        base_name: Base filename without extension.
+        content: Markdown content to write.
+
+    Returns:
+        The path of the written file.
+    """
+    out_dir.mkdir(parents=True, exist_ok=True)
+    counter = 0
+    while True:
+        suffix = "" if counter == 0 else f"_{counter}"
+        out_path = out_dir / f"{base_name}{suffix}.md"
+        try:
+            with out_path.open("x", encoding="utf-8") as md_file:
+                md_file.write(content)
+            return out_path
+        except FileExistsError:
+            counter += 1
+
+
 async def _process_input(input_val: str | Path, semaphore: asyncio.Semaphore, use_layout_engine: bool = False) -> str:
     """Internal wrapper to execute handlers for files or YouTube URLs.
 
     Args:
-        input_val: The input file path or YouTube URL.
+        input_val: The input file path or YouTube URL (validated upstream).
         semaphore: The concurrency gate to respect.
         use_layout_engine: Whether to use advanced PDF layout analysis.
 
@@ -164,7 +219,9 @@ async def _process_input(input_val: str | Path, semaphore: asyncio.Semaphore, us
         The generated Markdown content.
 
     Raises:
-        RuntimeError: If a YouTube transcript is unavailable.
+        TranscriptUnavailableError: If a YouTube transcript is unavailable.
+        Exception: Any handler error propagates to the caller, where it is
+            converted into a structured error result (the batch never aborts).
     """
     async with semaphore:
         input_str = str(input_val)
@@ -173,46 +230,33 @@ async def _process_input(input_val: str | Path, semaphore: asyncio.Semaphore, us
         yt_id = input_handler.extract_youtube_id(input_str)
         if yt_id:
             metadata_header = f"\n---\nsource: YouTube\nid: {yt_id}\ntype: youtube\n---\n\n"
-            try:
-                content = await asyncio.to_thread(input_handler.handle_youtube, yt_id)
-                return f"{metadata_header}{content}"
-            except Exception as e:
-                raise RuntimeError(
-                    f"No transcript available for YouTube video {yt_id}. Original error: {str(e)}. Please use 'handle_yt_local' for this video."
-                ) from e
+            content = await asyncio.to_thread(input_handler.handle_youtube, yt_id)
+            return f"{metadata_header}{content}"
 
-        # 2. Routing: Local File Handling
+        # 2. Routing: Local File Handling (extension validated upstream)
         file_path = Path(input_val)
         ext = file_path.suffix.lower()
-        handler = HANDLERS.get(ext)
+        handler = HANDLERS[ext]
 
         if ext == ".pdf":
-            metadata_header = ""
-        else:
-            metadata_header = f"\n---\nsource: {file_path.name}\ntype: {ext.lstrip('.')}\n---\n\n"
+            # PDF pages embed their own per-page metadata headers.
+            return await asyncio.to_thread(handler, file_path, use_layout_engine)
 
-        if not handler:
-            unsupported_header = f"\n---\nsource: {file_path.name}\ntype: {ext.lstrip('.')}\n---\n\n"
-            return f"{unsupported_header}### [Warning: Unsupported format {ext}]\n\n"
-
-        try:
-            if ext == ".pdf":
-                content = await asyncio.to_thread(handler, file_path, use_layout_engine)
-            else:
-                content = await asyncio.to_thread(handler, file_path)
-            return f"{metadata_header}{content}"
-        except Exception as e:
-            error_header = metadata_header or f"\n---\nsource: {file_path.name}\ntype: {ext.lstrip('.')}\n---\n\n"
-            sanitized_error = _sanitize_error(e)
-            return f"{error_header}### [Error processing file: {sanitized_error}]\n\n"
+        metadata_header = f"\n---\nsource: {file_path.name}\ntype: {ext.lstrip('.')}\n---\n\n"
+        content = await asyncio.to_thread(handler, file_path)
+        return f"{metadata_header}{content}"
 
 
 async def get_markdown(
     inputs: str | Path | Iterable[str | Path],
     use_layout_engine: bool = False,
     max_transcriptions: int = 1,
-) -> List[str]:
+    output_dir: str | Path | None = None,
+) -> List[ConversionResult]:
     """The main conversion engine for a batch of files and YouTube URLs.
+
+    A failed input never aborts the batch: every input yields exactly one
+    structured ConversionResult, and failures additionally emit warnings.
 
     Args:
         inputs: A single path or a collection of file paths or YouTube URLs.
@@ -220,91 +264,119 @@ async def get_markdown(
         max_transcriptions: Maximum number of concurrent Whisper transcription
             jobs for audio/video files. Defaults to 1 because transcription is
             CPU/memory heavy.
+        output_dir: Optional output directory for the generated Markdown
+            files. Defaults to './raw_data' in the current working directory.
+            When provided, successful results also carry a human-readable
+            success message.
 
     Returns:
-        A list of absolute paths to the generated Markdown files.
+        One ConversionResult per input, in input order. Successful results
+        contain the Markdown content and the output Path; failures produce
+        status "error" (or "skipped" for unsupported formats) with a
+        machine-readable error description and an optional suggestion.
     """
     if isinstance(inputs, (str, Path)):
-        input_list = [inputs]
+        input_list: List[str | Path] = [inputs]
     else:
         input_list = list(inputs)
+
+    custom_output = output_dir is not None
+    out_dir = Path(output_dir) if output_dir is not None else Path.cwd() / DEFAULT_OUTPUT_DIR
 
     small_task_semaphore = asyncio.Semaphore(MAX_CONCURRENT_TASKS)
     large_file_semaphore = asyncio.Semaphore(1)
     transcription_semaphore = asyncio.Semaphore(max_transcriptions)
 
-    raw_data_dir = Path.cwd() / "raw_data"
-    raw_data_dir.mkdir(parents=True, exist_ok=True)
+    results: List[Optional[ConversionResult]] = [None] * len(input_list)
+    tasks: List[Optional[asyncio.Task[str]]] = [None] * len(input_list)
 
-    pending_tasks: List[asyncio.Task[str] | asyncio.Future[str]] = []
-    for item in input_list:
+    for i, item in enumerate(input_list):
         input_str = str(item)
         yt_id = input_handler.extract_youtube_id(input_str)
 
         if yt_id:
-            pending_tasks.append(asyncio.create_task(_process_input(input_str, small_task_semaphore)))
+            tasks[i] = asyncio.create_task(_process_input(input_str, small_task_semaphore))
             continue
 
         file_path = Path(item)
-        if file_path.suffix.lower() not in ALLOWED_EXTENSIONS:
-            error_msg = f"\n\n---\n### [Warning: Input not supported: {file_path.name}]\n---\n\n"
-            f: asyncio.Future[str] = asyncio.Future()
-            f.set_result(error_msg)
-            pending_tasks.append(f)
+        ext = file_path.suffix.lower()
+
+        if ext not in ALLOWED_EXTENSIONS:
+            results[i] = ConversionResult(
+                input=input_str,
+                status="skipped",
+                error=f"Unsupported format: '{ext or 'no extension'}'",
+            )
             continue
 
         if not file_path.is_file():
-            error_msg = f"\n\n---\n### [Error: File not found: {file_path.name}]\n---\n\n"
-            missing: asyncio.Future[str] = asyncio.Future()
-            missing.set_result(error_msg)
-            pending_tasks.append(missing)
+            results[i] = ConversionResult(
+                input=input_str,
+                status="error",
+                error=f"File not found: {file_path.name}",
+            )
             continue
 
-        ext = file_path.suffix.lower()
         if ext in TRANSCRIPTION_EXTENSIONS:
-            # Whisper jobs are CPU/memory heavy: never run N of them in parallel,
-            # regardless of how small the files are.
+            # Whisper jobs are CPU/memory heavy: never run N of them in
+            # parallel, regardless of how small the files are.
             sem = transcription_semaphore
         else:
             file_size = file_path.stat().st_size
             sem = small_task_semaphore if file_size <= MAX_PARALLEL_SIZE else large_file_semaphore
-        pending_tasks.append(asyncio.create_task(_process_input(file_path, sem, use_layout_engine)))
+        tasks[i] = asyncio.create_task(_process_input(file_path, sem, use_layout_engine))
 
-    output_paths: List[str] = []
-    for item, task in zip(input_list, pending_tasks):
-        result = await task
+    pending = [t for t in tasks if t is not None]
+    if pending:
+        # return_exceptions=True guarantees that one failure never kills the
+        # batch and that no in-flight task is left orphaned.
+        await asyncio.gather(*pending, return_exceptions=True)
+
+    for i, (item, task) in enumerate(zip(input_list, tasks)):
+        if task is None:
+            continue  # Already resolved during validation.
+
         input_str = str(item)
-        yt_id = input_handler.extract_youtube_id(input_str)
+        exc = task.exception()
+        if exc is not None:
+            suggestion = "handle_yt_local" if isinstance(exc, TranscriptUnavailableError) else None
+            results[i] = ConversionResult(
+                input=input_str,
+                status="error",
+                error=_sanitize_error(exc),
+                suggestion=suggestion,
+            )
+            continue
 
+        content = task.result()
+        yt_id = input_handler.extract_youtube_id(input_str)
         if yt_id:
             base_name = f"youtube_{yt_id}"
         else:
             file_path = Path(item)
-            ext_clean = file_path.suffix.lower().lstrip(".")
-            base_name = f"{file_path.stem}_{ext_clean}"
+            base_name = f"{file_path.stem}_{file_path.suffix.lower().lstrip('.')}"
 
-        out_name = f"{base_name}.md"
-        out_path = raw_data_dir / out_name
+        out_path = _write_markdown(out_dir, base_name, content)
+        message = f"Success: '{input_str}' converted and written to '{out_path}'" if custom_output else None
+        results[i] = ConversionResult(
+            input=input_str,
+            status="success",
+            content=content,
+            output_path=out_path,
+            message=message,
+        )
 
-        counter = 1
-        while out_path.exists():
-            out_name = f"{base_name}_{counter}.md"
-            out_path = raw_data_dir / out_name
-            counter += 1
-
-        with out_path.open("w", encoding="utf-8") as md_file:
-            md_file.write(result)
-
-        output_paths.append(str(out_path))
-
-    return output_paths
+    final_results = [r for r in results if r is not None]
+    _warn_about_failures(final_results)
+    return final_results
 
 
 async def get_markdown_directory(
     directory_path: str | Path,
     use_layout_engine: bool = False,
     max_transcriptions: int = 1,
-) -> Optional[List[str]]:
+    output_dir: str | Path | None = None,
+) -> Optional[List[ConversionResult]]:
     """Crawls a directory recursively and converts supported files.
 
     Args:
@@ -312,9 +384,10 @@ async def get_markdown_directory(
         use_layout_engine: Whether to use advanced PDF layout analysis.
         max_transcriptions: Maximum number of concurrent Whisper transcription
             jobs for audio/video files.
+        output_dir: Optional output directory (defaults to './raw_data').
 
     Returns:
-        List of output file paths, or None if no supported files found.
+        A list of ConversionResult objects, or None if no supported files found.
 
     Raises:
         ValueError: If the provided path is not a valid directory.
@@ -335,25 +408,33 @@ async def get_markdown_directory(
 
     file_list.sort()
     return await get_markdown(
-        file_list, use_layout_engine=use_layout_engine, max_transcriptions=max_transcriptions
+        file_list,
+        use_layout_engine=use_layout_engine,
+        max_transcriptions=max_transcriptions,
+        output_dir=output_dir,
     )
 
 
-def handle_yt_local(urls: str | List[str]) -> List[str]:
+def handle_yt_local(urls: str | List[str]) -> List[ConversionResult]:
     """Heavy-duty YouTube processor using Whisper transcription.
 
     Downloads the audio-only stream (no video) and feeds it directly to the
     Whisper engine. This means smaller downloads, no transcoding, and no
     FFmpeg requirement for this path (faster-whisper accepts m4a/webm directly).
 
+    Unlike get_markdown, this function writes nothing to disk: the
+    transcription is returned in each result's `content` field.
+
     Args:
         urls: A single YouTube URL or a list of URLs.
 
     Returns:
-        A list of generated Markdown transcription strings.
+        One ConversionResult per URL, in input order.
     """
+    yt_dlp = input_handler.require_dependency("yt_dlp", "youtube")
+
     url_list = [urls] if isinstance(urls, str) else urls
-    transcriptions: List[str] = []
+    results: List[ConversionResult] = []
 
     for url in url_list:
         temp_dir = tempfile.gettempdir()
@@ -374,18 +455,18 @@ def handle_yt_local(urls: str | List[str]) -> List[str]:
                 downloaded_file = ydl.prepare_filename(info)
 
             path = Path(downloaded_file)
-            if path.stat().st_size > 200 * 1024 * 1024:
+            if path.stat().st_size > MAX_PARALLEL_SIZE:
                 path.unlink(missing_ok=True)
                 raise ValueError("file is too large to process")
 
             # Feed the audio file straight to Whisper; skip handle_video's
             # ffmpeg-based audio extraction entirely.
             transcription = input_handler.handle_audio(downloaded_file)
-            transcriptions.append(transcription)
             path.unlink(missing_ok=True)
+            results.append(ConversionResult(input=url, status="success", content=transcription))
 
         except Exception as e:
-            sanitized_error = _sanitize_error(e)
-            transcriptions.append(f"\n\n### [Error processing YouTube video locally: {sanitized_error}]\n\n")
+            results.append(ConversionResult(input=url, status="error", error=_sanitize_error(e)))
 
-    return transcriptions
+    _warn_about_failures(results)
+    return results

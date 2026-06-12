@@ -2,31 +2,34 @@
 
 Supports text, documents, spreadsheets, presentations, images (OCR),
 PDFs (with table detection), audio, video, and YouTube transcripts.
+
+Heavy optional dependencies (PyMuPDF, Tesseract/Pillow, faster-whisper,
+youtube-transcript-api, yt-dlp) are imported lazily so that the core package
+stays importable and lightweight without the corresponding extras.
 """
 
 from __future__ import annotations
 
+import importlib
 import re
 import subprocess
 import tempfile
 import threading
+import warnings
 from pathlib import Path
-from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 from uuid import uuid4
 
-import fitz  # PyMuPDF
 import pandas as pd
-import pytesseract
 from docx import Document
 from docx.oxml.table import CT_Tbl
 from docx.oxml.text.paragraph import CT_P
 from docx.table import Table
 from docx.text.paragraph import Paragraph
-from PIL import Image
 from pptx import Presentation
-from youtube_transcript_api import YouTubeTranscriptApi
 
 if TYPE_CHECKING:
+    import fitz
     from faster_whisper import WhisperModel
 
 # PyMuPDF span flag bits: bit 1 (value 2) is italic, bit 4 (value 16) is bold.
@@ -36,6 +39,37 @@ _BOLD_FLAG: int = 1 << 4
 # Initialized lazily to save resources if no audio/video files are processed
 _whisper_model: Optional[WhisperModel] = None
 _model_lock = threading.Lock()
+
+
+class MissingDependencyError(ImportError):
+    """Raised when an optional dependency required by a handler is not installed."""
+
+
+class TranscriptUnavailableError(RuntimeError):
+    """Raised when a YouTube transcript cannot be retrieved."""
+
+
+def require_dependency(module_name: str, extra: str) -> Any:
+    """Imports an optional dependency or raises an actionable error.
+
+    Args:
+        module_name: The importable module name (e.g. 'fitz', 'PIL.Image').
+        extra: The pip extra that provides the module (e.g. 'pdf').
+
+    Returns:
+        The imported module.
+
+    Raises:
+        MissingDependencyError: If the module is not installed, with the exact
+            pip command needed to fix it.
+    """
+    try:
+        return importlib.import_module(module_name)
+    except ImportError as e:
+        raise MissingDependencyError(
+            f"The '{module_name}' package is required for this feature. "
+            f"Install it with: pip install any-to-markdown[{extra}]"
+        ) from e
 
 
 def get_whisper_model() -> WhisperModel:
@@ -48,12 +82,15 @@ def get_whisper_model() -> WhisperModel:
 
     Returns:
          WhisperModel: An initialized instance of the Faster-Whisper model.
+
+    Raises:
+        MissingDependencyError: If the 'audio' extra is not installed.
     """
     global _whisper_model
     with _model_lock:
         if _whisper_model is None:
-            import ctranslate2
-            from faster_whisper import WhisperModel
+            ctranslate2 = require_dependency("ctranslate2", "audio")
+            faster_whisper = require_dependency("faster_whisper", "audio")
 
             # Auto-detect CUDA capability
             device = "cuda" if ctranslate2.get_cuda_device_count() > 0 else "cpu"
@@ -63,7 +100,7 @@ def get_whisper_model() -> WhisperModel:
             compute_type = "float16" if device == "cuda" else "int8"
 
             # Using 'small' model as a balance between speed and accuracy
-            _whisper_model = WhisperModel("small", device=device, compute_type=compute_type)
+            _whisper_model = faster_whisper.WhisperModel("small", device=device, compute_type=compute_type)
     return _whisper_model
 
 
@@ -205,8 +242,14 @@ def handle_image(file_path: str | Path) -> str:
 
     Returns:
         The extracted text content.
+
+    Raises:
+        MissingDependencyError: If the 'ocr' extra is not installed.
     """
-    with Image.open(file_path) as image:
+    pytesseract = require_dependency("pytesseract", "ocr")
+    pil_image = require_dependency("PIL.Image", "ocr")
+
+    with pil_image.open(file_path) as image:
         # Pre-processing for better OCR accuracy
         grayscale = image.convert("L")
         text: str = pytesseract.image_to_string(grayscale, config="--psm 6")
@@ -223,6 +266,8 @@ def _get_pdf_items(page: fitz.Page, ignore_bboxes: Optional[List[fitz.Rect]] = N
     Returns:
         List of (y_coordinate, content) tuples.
     """
+    fitz_mod = require_dependency("fitz", "pdf")
+
     if ignore_bboxes is None:
         ignore_bboxes = []
 
@@ -232,7 +277,7 @@ def _get_pdf_items(page: fitz.Page, ignore_bboxes: Optional[List[fitz.Rect]] = N
     for b in blocks:
         if b["type"] == 0:  # text block
             # Spatial exclusion: Skip text that overlaps with detected table regions
-            if any(fitz.Rect(b["bbox"]).intersects(ib) for ib in ignore_bboxes):
+            if any(fitz_mod.Rect(b["bbox"]).intersects(ib) for ib in ignore_bboxes):
                 continue
 
             y = b["bbox"][1]
@@ -269,19 +314,29 @@ def handle_pdf(file_path: str | Path, use_layout_engine: bool = False) -> str:
 
     Returns:
         The structured Markdown content of the PDF.
+
+    Raises:
+        MissingDependencyError: If the 'pdf' extra is not installed.
     """
+    fitz_mod = require_dependency("fitz", "pdf")
+
     if use_layout_engine:
         try:
             import pymupdf4llm
+
             return pymupdf4llm.to_markdown(str(file_path))
         except ImportError:
-            # Silently fallback if the extra isn't installed
-            pass
+            warnings.warn(
+                "pymupdf4llm is not installed; falling back to the built-in PDF engine. "
+                "Install it with: pip install any-to-markdown[pdf]",
+                UserWarning,
+                stacklevel=2,
+            )
 
     parts: List[str] = []
     path = Path(file_path)
     file_name = path.name
-    with fitz.open(path) as doc:
+    with fitz_mod.open(path) as doc:
         for page_no, page in enumerate(doc, start=1):
             parts.append(f"---\nsource: {file_name}\npage: {page_no}\ntype: pdf\n---\n\n")
 
@@ -313,11 +368,14 @@ def handle_pdf(file_path: str | Path, use_layout_engine: bool = False) -> str:
 
                 try:
                     # Render the page at 2x zoom for high-quality OCR
-                    pix = page.get_pixmap(matrix=fitz.Matrix(2, 2))
+                    pix = page.get_pixmap(matrix=fitz_mod.Matrix(2, 2))
                     pix.save(img_path)
                     ocr_text = handle_image(img_path)
                     if ocr_text and ocr_text not in text:
                         parts.append(f"\n> [Visual Content OCR]:\n> {ocr_text}\n\n")
+                except MissingDependencyError as exc:
+                    # Degrade gracefully: a missing OCR extra should not fail the PDF.
+                    warnings.warn(f"Skipping OCR fallback: {exc}", UserWarning, stacklevel=2)
                 finally:
                     img_path.unlink(missing_ok=True)
     return "".join(parts)
@@ -399,6 +457,9 @@ def handle_audio(file_path: str | Path) -> str:
 
     Returns:
         The generated transcript text.
+
+    Raises:
+        MissingDependencyError: If the 'audio' extra is not installed.
     """
     whisper_model = get_whisper_model()
     # segments is a generator; we consume it to get the full transcript
@@ -414,27 +475,43 @@ def handle_video(file_path: str | Path) -> str:
 
     Returns:
         The generated transcript text extracted from the video's audio.
+
+    Raises:
+        MissingDependencyError: If FFmpeg is not installed.
+        RuntimeError: If FFmpeg fails, including its stderr output for
+            diagnostics.
     """
     audio_path = Path(tempfile.gettempdir()) / f"temp_{uuid4()}.mp3"
 
     try:
-        # Extract the audio track without re-encoding video to save time
-        subprocess.run(
-            [
-                "ffmpeg",
-                "-i",
-                str(file_path),
-                "-q:a",
-                "0",
-                "-map",
-                "a",
-                str(audio_path),
-                "-y",
-            ],
-            check=True,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
+        # Extract the audio track without re-encoding video to save time.
+        # stderr is captured (not discarded) so failures are diagnosable.
+        try:
+            proc = subprocess.run(
+                [
+                    "ffmpeg",
+                    "-i",
+                    str(file_path),
+                    "-q:a",
+                    "0",
+                    "-map",
+                    "a",
+                    str(audio_path),
+                    "-y",
+                ],
+                capture_output=True,
+                text=True,
+            )
+        except FileNotFoundError as e:
+            raise MissingDependencyError(
+                "FFmpeg is required to process video files. "
+                "Install it from https://ffmpeg.org and ensure it is on your PATH."
+            ) from e
+
+        if proc.returncode != 0:
+            stderr_tail = (proc.stderr or "").strip()[-500:]
+            raise RuntimeError(f"ffmpeg failed with exit code {proc.returncode}: {stderr_tail}")
+
         return handle_audio(audio_path)
     finally:
         # Guarantee cleanup of the heavy audio file
@@ -465,10 +542,15 @@ def handle_youtube(video_id_or_url: str) -> str:
         The transcript text fetched from YouTube.
 
     Raises:
-        ValueError: If the transcript cannot be retrieved for any reason.
+        MissingDependencyError: If the 'youtube' extra is not installed.
+        TranscriptUnavailableError: If the transcript cannot be retrieved.
+            The original exception is preserved as __cause__.
     """
+    yta = require_dependency("youtube_transcript_api", "youtube")
+    no_transcript_found = getattr(yta, "NoTranscriptFound", Exception)
+
     video_id = extract_youtube_id(video_id_or_url) or video_id_or_url
-    api = YouTubeTranscriptApi()
+    api = yta.YouTubeTranscriptApi()
 
     try:
         transcript_list = api.list(video_id)
@@ -476,7 +558,7 @@ def handle_youtube(video_id_or_url: str) -> str:
         try:
             # Priority 1: English
             transcript = transcript_list.find_transcript(["en"])
-        except Exception:
+        except no_transcript_found:
             # Priority 2: Any available language
             transcript = next(iter(transcript_list))
 
@@ -487,5 +569,8 @@ def handle_youtube(video_id_or_url: str) -> str:
         return f"\n\n{text}\n\n"
 
     except Exception as e:
-        # Propagate error for the UI/Main logic to suggest local processing
-        raise ValueError(str(e)) from e
+        # Typed error with the original exception chained (no information loss).
+        raise TranscriptUnavailableError(
+            f"No transcript available for YouTube video {video_id}: {e}. "
+            "Use handle_yt_local() to transcribe it locally instead."
+        ) from e
