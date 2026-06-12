@@ -94,10 +94,7 @@ def test_transcription_extensions_are_gated() -> None:
 
 
 def test_sanitize_error_preserves_urls_and_masks_paths() -> None:
-    exc = ValueError(
-        "Failed for https://www.youtube.com/watch?v=dQw4w9WgXcQ "
-        "while reading /home/user/secret/file.txt"
-    )
+    exc = ValueError("Failed for https://www.youtube.com/watch?v=dQw4w9WgXcQ while reading /home/user/secret/file.txt")
 
     sanitized = main._sanitize_error(exc)
 
