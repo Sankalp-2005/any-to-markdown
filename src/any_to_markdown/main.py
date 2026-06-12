@@ -10,7 +10,7 @@ import os
 import re
 import tempfile
 from pathlib import Path
-from typing import Callable, Dict, Iterable, List, Optional, Union
+from typing import Callable, Dict, Iterable, List, Optional
 from uuid import uuid4
 
 import yt_dlp
@@ -34,12 +34,18 @@ ALLOWED_EXTENSIONS: set[str] = {
     ".docx",
     ".xls",
     ".xlsx",
+    ".csv",
     ".pptx",
     ".pdf",
     ".png",
     ".jpeg",
     ".jpg",
+    ".tiff",
+    ".tif",
+    ".bmp",
     ".mp3",
+    ".wav",
+    ".m4a",
     ".mp4",
     ".ipynb",
     ".py",
@@ -64,19 +70,25 @@ ALLOWED_EXTENSIONS: set[str] = {
 }
 
 # Mapping of file extensions to their respective processing functions in input_handler.
-HANDLERS: Dict[str, Callable[[Union[str, Path], ...], str]] = {
+HANDLERS: Dict[str, Callable[..., str]] = {
     ".txt": input_handler.handle_text,
     ".json": input_handler.handle_code,
     ".md": input_handler.handle_text,
     ".docx": input_handler.handle_document,
     ".xls": input_handler.handle_excel,
     ".xlsx": input_handler.handle_excel,
+    ".csv": input_handler.handle_csv,
     ".pptx": input_handler.handle_powerpoint,
     ".pdf": input_handler.handle_pdf,
     ".png": input_handler.handle_image,
     ".jpg": input_handler.handle_image,
     ".jpeg": input_handler.handle_image,
+    ".tiff": input_handler.handle_image,
+    ".tif": input_handler.handle_image,
+    ".bmp": input_handler.handle_image,
     ".mp3": input_handler.handle_audio,
+    ".wav": input_handler.handle_audio,
+    ".m4a": input_handler.handle_audio,
     ".mp4": input_handler.handle_video,
     ".ipynb": input_handler.handle_notebook,
     ".py": input_handler.handle_code,
@@ -144,10 +156,7 @@ async def _process_input(input_val: str | Path, semaphore: asyncio.Semaphore, us
         use_layout_engine: Whether to use advanced PDF layout analysis.
 
     Returns:
-        The generated Markdown content.
-
-    Raises:
-        RuntimeError: If a YouTube transcript is unavailable.
+        The generated Markdown content, or error markdown if processing fails.
     """
     async with semaphore:
         input_str = str(input_val)
@@ -160,9 +169,13 @@ async def _process_input(input_val: str | Path, semaphore: asyncio.Semaphore, us
                 content = await asyncio.to_thread(input_handler.handle_youtube, yt_id)
                 return f"{metadata_header}{content}"
             except Exception as e:
-                raise RuntimeError(
-                    f"No transcript available for YouTube video {yt_id}. Original error: {str(e)}. Please use 'handle_yt_local' for this video."
-                ) from e
+                # Match the file-error contract: return error markdown instead of raising,
+                # so one failed video cannot abort an entire batch.
+                sanitized_error = _sanitize_error(e)
+                return (
+                    f"{metadata_header}### [Error: No transcript available for YouTube video {yt_id}: "
+                    f"{sanitized_error}. Please use 'handle_yt_local' for this video.]\n\n"
+                )
 
         # 2. Routing: Local File Handling
         file_path = Path(input_val)
@@ -226,6 +239,13 @@ async def get_markdown(inputs: str | Path | Iterable[str | Path], use_layout_eng
             f: asyncio.Future[str] = asyncio.Future()
             f.set_result(error_msg)
             pending_tasks.append(f)
+            continue
+
+        if not file_path.is_file():
+            error_msg = f"\n\n---\n### [Error: File not found: {file_path.name}]\n---\n\n"
+            missing: asyncio.Future[str] = asyncio.Future()
+            missing.set_result(error_msg)
+            pending_tasks.append(missing)
             continue
 
         file_size = file_path.stat().st_size
