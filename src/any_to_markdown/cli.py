@@ -46,6 +46,7 @@ async def _convert(
                     max_transcriptions=max_transcriptions,
                     output_dir=output_dir,
                     whisper_model=whisper_model,
+                    show_progress=True,
                 )
             )
         else:
@@ -59,6 +60,7 @@ async def _convert(
                 max_transcriptions=max_transcriptions,
                 output_dir=output_dir,
                 whisper_model=whisper_model,
+                show_progress=True,
             )
         )
     return results

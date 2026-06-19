@@ -5,6 +5,27 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.1] - 2026-06-19
+
+### Added
+
+- Live terminal progress bars during batch conversion. All four public batch
+  functions — `get_markdown`, `get_markdown_directory`, `handle_yt_local`, and
+  `handle_yt_local_async` — now render a per-input `rich` progress bar to stderr
+  (e.g. `Converting 3/206 • 0:00:12`) while the conversion work is in flight.
+- New `show_progress: bool = True` parameter on every batch function. Pass
+  `show_progress=False` to suppress the bar from library code.
+- `ANY_TO_MARKDOWN_NO_PROGRESS` environment variable: set it to any truthy value
+  (`1`, `true`, `yes`, …) to disable the bar globally without code changes.
+- Automatic suppression when stderr is not a TTY (piped output, redirected
+  logs, CI captures), so the bar never pollutes non-interactive runs.
+- `rich>=13.7.0` added as a core dependency.
+
+### Fixed
+
+- `handle_yt_local_async` previously produced no feedback during long
+  transcriptions; the new progress bar advances once per completed URL.
+
 ## [0.2.0] - 2026-06-13
 
 ### Added
@@ -43,18 +64,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `handle_yt_local`'s download size cap is now its own constant
   (`MAX_DOWNLOAD_SIZE`) instead of silently reusing the concurrency threshold
   (`MAX_PARALLEL_SIZE`).
-
-## [0.2.0] - 2026-06-12
-
-### Added
-
-- Structured `ConversionResult` API: every input yields an explicit
-  `success`/`error`/`skipped` result with content, output path, sanitized
-  error, and suggestion fields.
-- Dependency extras `[pdf]`, `[ocr]`, `[audio]`, `[youtube]`, `[all]`; the core
-  install stays small. Missing extras raise an actionable
-  `MissingDependencyError`.
-- `__version__` resolved from package metadata via `importlib.metadata`.
 
 ### Removed
 

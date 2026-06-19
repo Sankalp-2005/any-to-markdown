@@ -85,13 +85,13 @@ any-to-markdown --version
 
 Options:
 
-| Option | Meaning |
-|---|---|
-| `-o, --output-dir PATH` | Output directory (defaults to `./raw_data`) |
-| `--layout` | Use the `pymupdf4llm` layout engine for PDFs |
-| `--max-transcriptions N` | Concurrent Whisper jobs (default 1) |
-| `--whisper-model SIZE` | Whisper model size (`tiny`, `small`, `medium`, ...) |
-| `--version` | Print the version and exit |
+| Option                   | Meaning                                             |
+| ------------------------ | --------------------------------------------------- |
+| `-o, --output-dir PATH`  | Output directory (defaults to `./raw_data`)         |
+| `--layout`               | Use the `pymupdf4llm` layout engine for PDFs        |
+| `--max-transcriptions N` | Concurrent Whisper jobs (default 1)                 |
+| `--whisper-model SIZE`   | Whisper model size (`tiny`, `small`, `medium`, ...) |
+| `--version`              | Print the version and exit                          |
 
 The command prints one line per input and exits with code `1` if any input errored (skipped inputs do not affect the exit code).
 
@@ -101,26 +101,28 @@ The command prints one line per input and exits with code `1` if any input error
 
 The package exports the following from `any_to_markdown`:
 
-- `get_markdown(inputs, use_layout_engine=False, max_transcriptions=1, output_dir=None, whisper_model=None)`
-- `get_markdown_directory(directory_path, use_layout_engine=False, max_transcriptions=1, output_dir=None, whisper_model=None)`
-- `handle_yt_local(urls, max_transcriptions=1, output_dir=None, whisper_model=None)`
+- `get_markdown(inputs, use_layout_engine=False, max_transcriptions=1, output_dir=None, whisper_model=None, show_progress=True)`
+- `get_markdown_directory(directory_path, use_layout_engine=False, max_transcriptions=1, output_dir=None, whisper_model=None, show_progress=True)`
+- `handle_yt_local(urls, max_transcriptions=1, output_dir=None, whisper_model=None, show_progress=True)`
 - `handle_yt_local_async(...)` (same signature, awaitable)
 - `ConversionResult`, `ConversionStatus`, `MissingDependencyError`, `TranscriptUnavailableError`
+
+All batch functions display a live terminal progress bar by default (powered by `rich`, rendered to stderr). Set `show_progress=False` to suppress it, or set the `ANY_TO_MARKDOWN_NO_PROGRESS=1` environment variable to disable it globally. The bar is automatically suppressed when stderr is not a TTY (piped output, CI logs, etc.).
 
 ### ConversionResult
 
 Every conversion function returns one `ConversionResult` per input:
 
-| Field | Meaning |
-|---|---|
-| `input` | The original path or URL |
-| `status` | `"success"`, `"error"`, or `"skipped"` (typed as `ConversionStatus`) |
-| `ok` | Convenience property, `True` on success |
-| `content` | The generated Markdown (on success) |
-| `output_path` | `Path` to the written `.md` file (default output mode) |
-| `message` | Human-readable success message (when you pass `output_dir`) |
-| `error` | Sanitized, machine-readable error description |
-| `suggestion` | Suggested alternative, e.g. `handle_yt_local` for failed transcripts |
+| Field         | Meaning                                                              |
+| ------------- | -------------------------------------------------------------------- |
+| `input`       | The original path or URL                                             |
+| `status`      | `"success"`, `"error"`, or `"skipped"` (typed as `ConversionStatus`) |
+| `ok`          | Convenience property, `True` on success                              |
+| `content`     | The generated Markdown (on success)                                  |
+| `output_path` | `Path` to the written `.md` file (default output mode)               |
+| `message`     | Human-readable success message (when you pass `output_dir`)          |
+| `error`       | Sanitized, machine-readable error description                        |
+| `suggestion`  | Suggested alternative, e.g. `handle_yt_local` for failed transcripts |
 
 ### PDF Layout Mode
 
@@ -181,6 +183,16 @@ if __name__ == "__main__":
 results = await get_markdown("docs/report.pdf", output_dir="converted/")
 print(results[0].message)
 # Success: 'docs/report.pdf' converted and written to 'converted/report_pdf.md'
+```
+
+### Disable the progress bar
+
+```python
+# Per-call: library callers that manage their own UI can suppress the bar.
+results = await get_markdown(large_batch, show_progress=False)
+
+# Global: set the env var to suppress the bar everywhere in the process.
+# ANY_TO_MARKDOWN_NO_PROGRESS=1 python my_script.py
 ```
 
 ### Convert a directory recursively
@@ -252,7 +264,7 @@ results = await handle_yt_local_async(urls, max_transcriptions=2, output_dir="tr
 
 Releases are published to PyPI automatically when a version tag (e.g. `v0.3.0`) is pushed, using [PyPI Trusted Publishing](https://docs.pypi.org/trusted-publishers/) - no API token is stored in CI.
 
-One-time setup on PyPI: under the project's *Publishing* settings, add a **GitLab** trusted publisher with namespace `sankalp-group`, project `any-to-markdown`, and workflow file `.gitlab-ci.yml`.
+One-time setup on PyPI: under the project's _Publishing_ settings, add a **GitLab** trusted publisher with namespace `sankalp-group`, project `any-to-markdown`, and workflow file `.gitlab-ci.yml`.
 
 Release steps:
 

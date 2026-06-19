@@ -52,3 +52,23 @@ def test_cli_version_flag() -> None:
 
     assert result.exit_code == 0
     assert __version__ in result.stdout
+
+
+def test_cli_progress_disabled_in_test_runner(tmp_path: Path) -> None:
+    """CliRunner is non-interactive, so progress must auto-disable.
+
+    Under pytest (and CI) stderr is not a TTY, so the Rich bar never starts.
+    This guards two things: (1) existing stdout summary assertions still hold,
+    and (2) invoking the CLI in a non-TTY context does not raise from the
+    progress layer and does not pollute stdout with bar output.
+    """
+    source = tmp_path / "note.txt"
+    source.write_text("cli progress", encoding="utf-8")
+    out_dir = tmp_path / "out"
+
+    result = runner.invoke(app, [str(source), "-o", str(out_dir)])
+
+    assert result.exit_code == 0
+    assert "1/1 inputs converted." in result.stdout
+    # The summary line is the only stdout content; no spinner/bar fragments.
+    assert "Converting" not in result.stdout

@@ -13,11 +13,12 @@ import tempfile
 import warnings
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Dict, Iterable, List, Literal, Optional
+from typing import Callable, Dict, Iterable, List, Literal, Optional, TypeVar
 from uuid import uuid4
 
 from . import input_handler
 from .input_handler import TranscriptUnavailableError
+from .progress import ProgressReporter, default_progress_reporter
 
 # --- Processing Constraints ---
 
@@ -282,12 +283,47 @@ async def _process_input(
         return f"{metadata_header}{content}"
 
 
+# Generic result type for the progress-tracked gather: file tasks return str,
+# YouTube tasks return ConversionResult. The helper is result-type-agnostic.
+_T = TypeVar("_T")
+
+
+async def _gather_with_progress(
+    tasks: List["asyncio.Task[_T]"],
+    reporter: ProgressReporter,
+) -> None:
+    """Awaits a batch of tasks, advancing ``reporter`` once per completion.
+
+    Each task is wrapped so its ``finally`` block calls ``reporter.advance()``
+    regardless of whether the task succeeded, raised, or was cancelled. The
+    gathered results still respect ``return_exceptions=True`` semantics, so a
+    single failure never aborts the batch and never leaves the bar short of its
+    total. The reporter is started/stopped exactly once around the whole batch.
+    """
+    if not tasks:
+        return
+
+    reporter.start(len(tasks))
+
+    async def _tracked(task: "asyncio.Task[_T]") -> _T:
+        try:
+            return await task
+        finally:
+            reporter.advance()
+
+    try:
+        await asyncio.gather(*(_tracked(t) for t in tasks), return_exceptions=True)
+    finally:
+        reporter.stop()
+
+
 async def get_markdown(
     inputs: str | Path | Iterable[str | Path],
     use_layout_engine: bool = False,
     max_transcriptions: int = 1,
     output_dir: str | Path | None = None,
     whisper_model: Optional[str] = None,
+    show_progress: bool = True,
 ) -> List[ConversionResult]:
     """The main conversion engine for a batch of files and YouTube URLs.
 
@@ -307,6 +343,10 @@ async def get_markdown(
         whisper_model: Optional Whisper model size for audio/video inputs
             (e.g. 'tiny', 'small', 'medium'). Defaults to the
             ANY_TO_MARKDOWN_WHISPER_MODEL environment variable, or 'small'.
+        show_progress: When True (default), render a live progress bar to
+            stderr during conversion. Automatically suppressed when stderr is
+            not a TTY (e.g. piped output, CI logs) or when the
+            ANY_TO_MARKDOWN_NO_PROGRESS environment variable is set.
 
     Returns:
         One ConversionResult per input, in input order. Successful results
@@ -372,8 +412,11 @@ async def get_markdown(
     pending = [t for t in tasks if t is not None]
     if pending:
         # return_exceptions=True guarantees that one failure never kills the
-        # batch and that no in-flight task is left orphaned.
-        await asyncio.gather(*pending, return_exceptions=True)
+        # batch and that no in-flight task is left orphaned. The progress
+        # reporter is driven from _gather_with_progress (one advance() per
+        # completed task); it is a no-op when progress is disabled.
+        reporter = default_progress_reporter(show_progress, description="Converting")
+        await _gather_with_progress(pending, reporter)
 
     for i, (item, task) in enumerate(zip(input_list, tasks)):
         if task is None:
@@ -420,6 +463,7 @@ async def get_markdown_directory(
     max_transcriptions: int = 1,
     output_dir: str | Path | None = None,
     whisper_model: Optional[str] = None,
+    show_progress: bool = True,
 ) -> List[ConversionResult]:
     """Crawls a directory recursively and converts supported files.
 
@@ -430,6 +474,9 @@ async def get_markdown_directory(
             jobs for audio/video files.
         output_dir: Optional output directory (defaults to './raw_data').
         whisper_model: Optional Whisper model size for audio/video inputs.
+        show_progress: When True (default), render a live progress bar to
+            stderr. Suppressed on non-TTY or when
+            ANY_TO_MARKDOWN_NO_PROGRESS is set.
 
     Returns:
         A list of ConversionResult objects; empty if the directory contains
@@ -459,6 +506,7 @@ async def get_markdown_directory(
         max_transcriptions=max_transcriptions,
         output_dir=output_dir,
         whisper_model=whisper_model,
+        show_progress=show_progress,
     )
 
 
@@ -512,6 +560,7 @@ async def handle_yt_local_async(
     max_transcriptions: int = 1,
     output_dir: str | Path | None = None,
     whisper_model: Optional[str] = None,
+    show_progress: bool = True,
 ) -> List[ConversionResult]:
     """Heavy-duty YouTube processor using Whisper transcription (async).
 
@@ -529,6 +578,9 @@ async def handle_yt_local_async(
             collision-safe writer, and the result carries output_path plus a
             human-readable message. When omitted, nothing is written to disk.
         whisper_model: Optional Whisper model size (see get_whisper_model).
+        show_progress: When True (default), render a live progress bar to
+            stderr. Suppressed on non-TTY or when
+            ANY_TO_MARKDOWN_NO_PROGRESS is set.
 
     Returns:
         One ConversionResult per URL, in input order. The transcription is
@@ -559,7 +611,12 @@ async def handle_yt_local_async(
             result.message = f"Success: '{url}' converted and written to '{out_path}'"
         return result
 
-    results = list(await asyncio.gather(*(process(url) for url in url_list)))
+    reporter = default_progress_reporter(show_progress, description="Transcribing")
+    youtube_tasks = [asyncio.create_task(process(url)) for url in url_list]
+    await _gather_with_progress(youtube_tasks, reporter)
+    # process() never raises (it catches internally), so each task holds a
+    # ConversionResult. Read them in input order.
+    results = [t.result() for t in youtube_tasks]
     _warn_about_failures(results)
     return results
 
@@ -569,6 +626,7 @@ def handle_yt_local(
     max_transcriptions: int = 1,
     output_dir: str | Path | None = None,
     whisper_model: Optional[str] = None,
+    show_progress: bool = True,
 ) -> List[ConversionResult]:
     """Synchronous wrapper around handle_yt_local_async.
 
@@ -580,6 +638,9 @@ def handle_yt_local(
         max_transcriptions: Maximum number of concurrent transcription jobs.
         output_dir: Optional output directory (see handle_yt_local_async).
         whisper_model: Optional Whisper model size (see get_whisper_model).
+        show_progress: When True (default), render a live progress bar to
+            stderr. Suppressed on non-TTY or when
+            ANY_TO_MARKDOWN_NO_PROGRESS is set.
 
     Returns:
         One ConversionResult per URL, in input order.
@@ -596,6 +657,7 @@ def handle_yt_local(
                 max_transcriptions=max_transcriptions,
                 output_dir=output_dir,
                 whisper_model=whisper_model,
+                show_progress=show_progress,
             )
         )
     raise RuntimeError(

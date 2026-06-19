@@ -114,3 +114,35 @@ def test_download_cap_is_distinct_from_concurrency_threshold() -> None:
     # Both exist independently so tuning one never silently changes the other.
     assert main.MAX_DOWNLOAD_SIZE == 200 * 1024 * 1024
     assert main.MAX_PARALLEL_SIZE == 200 * 1024 * 1024
+
+
+def test_show_progress_param_accepted_by_all_public_functions(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Every batch function must accept show_progress=False without error.
+
+    Locks the new parameter into the public signature so it cannot be silently
+    dropped by a refactor. The YouTube path is backend-mocked so no real
+    download/transcription runs.
+    """
+    monkeypatch.chdir(tmp_path)
+    source = tmp_path / "note.txt"
+    source.write_text("hi", encoding="utf-8")
+
+    # get_markdown + get_markdown_directory: real .txt handler, progress off.
+    r1 = asyncio.run(main.get_markdown(str(source), show_progress=False))
+    assert r1[0].ok
+
+    docs = tmp_path / "docs"
+    docs.mkdir()
+    (docs / "a.txt").write_text("a", encoding="utf-8")
+    r2 = asyncio.run(main.get_markdown_directory(docs, show_progress=False))
+    assert len(r2) == 1
+
+    # handle_yt_local_async: bypass the youtube backend entirely.
+    monkeypatch.setattr(main.input_handler, "require_dependency", lambda name, extra: True)
+    monkeypatch.setattr(main, "_download_and_transcribe", lambda url, whisper_model: "t")
+    r3 = asyncio.run(main.handle_yt_local_async("https://www.youtube.com/watch?v=dQw4w9WgXcQ", show_progress=False))
+    assert r3[0].ok
+
+    # handle_yt_local (sync wrapper) forwards the flag too.
+    r4 = main.handle_yt_local("https://www.youtube.com/watch?v=dQw4w9WgXcQ", show_progress=False)
+    assert r4[0].ok
