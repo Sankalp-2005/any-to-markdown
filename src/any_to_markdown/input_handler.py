@@ -384,8 +384,12 @@ def handle_pdf(file_path: str | Path, use_layout_engine: bool = False) -> str:
             if text.strip():
                 parts.append(text + "\n\n")
 
-            # 5. Visual/OCR Fallback: Trigger if text is sparse or images are present
-            if len(text.strip()) < 100 or len(page.get_images()) > 0:
+            # 5. Visual/OCR Fallback: Only trigger when text extraction
+            #    yielded very little content, indicating the page is likely
+            #    image-based / scanned. The previous condition also fired when
+            #    *any* image was present (logos, charts, decorations), which
+            #    caused extreme slowness on image-rich but text-normal PDFs.
+            if len(text.strip()) < 100:
                 with tempfile.NamedTemporaryFile(suffix=f"_page_{page_no}.png", delete=False) as temp_image:
                     img_path = Path(temp_image.name)
 
@@ -396,9 +400,11 @@ def handle_pdf(file_path: str | Path, use_layout_engine: bool = False) -> str:
                     ocr_text = handle_image(img_path)
                     if ocr_text and ocr_text not in text:
                         parts.append(f"\n> [Visual Content OCR]:\n> {ocr_text}\n\n")
-                except MissingDependencyError as exc:
-                    # Degrade gracefully: a missing OCR extra should not fail the PDF.
-                    warnings.warn(f"Skipping OCR fallback: {exc}", UserWarning, stacklevel=2)
+                except Exception as exc:
+                    # Degrade gracefully: any OCR failure (missing dependency,
+                    # tesseract binary not found, processing error, etc.)
+                    # should never abort the entire PDF conversion.
+                    warnings.warn(f"Skipping OCR fallback for page {page_no}: {exc}", UserWarning, stacklevel=2)
                 finally:
                     img_path.unlink(missing_ok=True)
     return "".join(parts)

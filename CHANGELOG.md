@@ -5,6 +5,22 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.2] - 2026-06-20
+
+### Fixed
+
+- **PDF OCR fallback performance:** The OCR fallback previously triggered on
+  every page that contained *any* image (logos, charts, decorations), causing
+  extreme slowness on image-rich but text-normal PDFs. It now only fires when
+  the extracted text is truly sparse (< 100 characters), correctly limiting OCR
+  to genuinely scanned or image-based pages.
+- **Broader OCR error resilience:** The OCR fallback now catches all exceptions
+  (not just `MissingDependencyError`), so issues like a missing Tesseract
+  binary, processing errors, or unexpected failures never abort the entire PDF
+  conversion. A per-page warning is emitted instead.
+- **Improved OCR warning messages:** OCR fallback warnings now include the page
+  number for easier debugging (e.g. `Skipping OCR fallback for page 3: ...`).
+
 ## [0.2.1] - 2026-06-19
 
 ### Added

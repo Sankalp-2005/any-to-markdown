@@ -17,7 +17,7 @@ It is designed for documentation pipelines, retrieval-augmented generation (RAG)
 - **Batch Resilience:** One failed input never aborts the batch. Failures emit warnings naming the offending file, with a batch summary and a suggested alternative function.
 - **Opt-in Heavy Dependencies:** PDF, OCR, audio transcription, and YouTube support are pip extras; the core install stays small.
 - **Real HTML Conversion:** `.html`/`.htm` files are converted into structured Markdown (headings, lists, links, tables, code blocks), not just fenced as code. Scripts and styles are stripped.
-- **Optional PDF Layout Mode:** Layout analysis via `pymupdf4llm` heuristics (table detection and structure-aware Markdown). The default PDF engine uses PyMuPDF with font-size and bold-flag heuristics, plus an OCR fallback for image-heavy pages.
+- **Optional PDF Layout Mode:** Layout analysis via `pymupdf4llm` heuristics (table detection and structure-aware Markdown). The default PDF engine uses PyMuPDF with font-size and bold-flag heuristics, plus an OCR fallback for text-sparse pages (scanned/image-based content). The OCR fallback degrades gracefully if Tesseract is unavailable.
 - **YouTube Integration:** Fetches transcripts directly via the YouTube transcript API, or transcribes locally with Whisper via `handle_yt_local` (audio-only download, no FFmpeg required).
 - **Configurable Whisper:** Pick the transcription model size per call (`whisper_model="medium"`) or globally via the `ANY_TO_MARKDOWN_WHISPER_MODEL` environment variable.
 - **Honest Concurrency:** Small files run in parallel, files over 200MB run sequentially, and Whisper transcription jobs are limited to one at a time by default.
@@ -262,7 +262,7 @@ results = await handle_yt_local_async(urls, max_transcriptions=2, output_dir="tr
 
 ## Releasing (maintainers)
 
-Releases are published to PyPI automatically when a version tag (e.g. `v0.3.0`) is pushed, using [PyPI Trusted Publishing](https://docs.pypi.org/trusted-publishers/) - no API token is stored in CI.
+Releases are published to PyPI automatically when a version tag (e.g. `v0.2.2`) is pushed, using [PyPI Trusted Publishing](https://docs.pypi.org/trusted-publishers/) — no API token is stored in CI.
 
 One-time setup on PyPI: under the project's _Publishing_ settings, add a **GitLab** trusted publisher with namespace `sankalp-group`, project `any-to-markdown`, and workflow file `.gitlab-ci.yml`.
 
