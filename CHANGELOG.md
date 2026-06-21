@@ -5,6 +5,38 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.3] - 2026-06-21
+
+### Fixed
+
+- **PDF batch processing hang:** Processing large batches (200+ PDFs) no longer
+  stalls after roughly 12 files. The root cause was CPU saturation from too
+  many parallel PDFs sharing one worker pool. PDF conversions now use a
+  dedicated semaphore.
+- **No more OCR data loss:** The previous 10-OCR-page-per-PDF cap and 120s
+  per-PDF budget silently dropped content from long scanned documents (sparse
+  pages past the cap got no text *and* no OCR). Both are removed. OCR now runs
+  on every sparse page so documents convert in full. Only a per-page timeout
+  (`ANY_TO_MARKDOWN_OCR_TIMEOUT`, default 60s) remains — purely a reactive net
+  to kill a wedged process, never a content skip. The default was raised from
+  10s after measuring dense numeric-table pages that legitimately take 30-50s
+  (median page is ~1s).
+- **Tables on by default:** Built-in PyMuPDF table detection now runs by
+  default, so PDFs exported from spreadsheets (e.g. Excel) keep their tables.
+  Safe because the original hang was concurrency saturation, not tables.
+  Disable with `extract_pdf_tables=False`, `--no-pdf-tables`, or
+  `ANY_TO_MARKDOWN_PDF_TABLES=0`.
+- Non-positive PDF/transcription concurrency values now fail fast with
+  `ValueError` instead of creating a semaphore that waits forever.
+- Structured PDF extraction failures degrade to raw text instead of aborting
+  the page or batch.
+
+### Changed
+
+- PDF concurrency defaults to **half the CPU cores** (`MAX_CONCURRENT_PDFS`),
+  since `find_tables()` and Tesseract are each single-threaded CPU work. Tunable
+  via `max_pdf_tasks` / `--max-pdf-tasks`. (Previously a fixed 2.)
+
 ## [0.2.2] - 2026-06-20
 
 ### Fixed

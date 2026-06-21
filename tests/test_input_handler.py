@@ -48,6 +48,60 @@ def test_handle_pdf_italic_text_is_extracted(tmp_path: Path) -> None:
     assert "### Italic Statement" not in result
 
 
+def test_handle_pdf_detects_tables_by_default(tmp_path: Path, monkeypatch) -> None:
+    """Tables are detected by default so spreadsheet PDFs keep their tables."""
+    pdf_path = tmp_path / "default-tables.pdf"
+    _make_pdf(pdf_path, "Default PDF Path", "hebo")
+    original_find_tables = fitz.Page.find_tables
+    calls = 0
+
+    def track_call(page, *args, **kwargs):
+        nonlocal calls
+        calls += 1
+        return original_find_tables(page, *args, **kwargs)
+
+    monkeypatch.setattr(fitz.Page, "find_tables", track_call)
+
+    result = input_handler.handle_pdf(pdf_path)  # no extract_tables arg
+
+    assert calls == 1, "find_tables must run by default"
+    assert "### Default PDF Path" in result
+
+
+def test_handle_pdf_table_detection_can_be_disabled(tmp_path: Path, monkeypatch) -> None:
+    """extract_tables=False must skip find_tables even though it's the default."""
+    pdf_path = tmp_path / "no-tables.pdf"
+    _make_pdf(pdf_path, "Opted Out", "hebo")
+
+    def fail_if_called(*args, **kwargs):
+        raise AssertionError("find_tables must not run when extract_tables=False")
+
+    monkeypatch.setattr(fitz.Page, "find_tables", fail_if_called)
+
+    result = input_handler.handle_pdf(pdf_path, extract_tables=False)
+
+    assert "### Opted Out" in result
+
+
+def test_handle_pdf_table_detection_env_var_disables(tmp_path: Path, monkeypatch) -> None:
+    """ANY_TO_MARKDOWN_PDF_TABLES=0 must turn off table detection by default."""
+    pdf_path = tmp_path / "env-off.pdf"
+    _make_pdf(pdf_path, "Env Disabled", "hebo")
+
+    def fail_if_called(*args, **kwargs):
+        raise AssertionError("find_tables must not run when env var disables it")
+
+    monkeypatch.setattr(fitz.Page, "find_tables", fail_if_called)
+    monkeypatch.setenv("ANY_TO_MARKDOWN_PDF_TABLES", "0")
+
+    # Re-read the module-level default so the env override takes effect.
+    monkeypatch.setattr(input_handler, "_PDF_TABLE_DETECTION_ENABLED_BY_DEFAULT", False)
+
+    result = input_handler.handle_pdf(pdf_path)
+
+    assert "Env Disabled" in result
+
+
 def test_handle_csv_produces_markdown_table(tmp_path: Path) -> None:
     csv_path = tmp_path / "data.csv"
     csv_path.write_text("name,age\nalice,30\nbob,25\n", encoding="utf-8")

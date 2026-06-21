@@ -17,10 +17,10 @@ It is designed for documentation pipelines, retrieval-augmented generation (RAG)
 - **Batch Resilience:** One failed input never aborts the batch. Failures emit warnings naming the offending file, with a batch summary and a suggested alternative function.
 - **Opt-in Heavy Dependencies:** PDF, OCR, audio transcription, and YouTube support are pip extras; the core install stays small.
 - **Real HTML Conversion:** `.html`/`.htm` files are converted into structured Markdown (headings, lists, links, tables, code blocks), not just fenced as code. Scripts and styles are stripped.
-- **Optional PDF Layout Mode:** Layout analysis via `pymupdf4llm` heuristics (table detection and structure-aware Markdown). The default PDF engine uses PyMuPDF with font-size and bold-flag heuristics, plus an OCR fallback for text-sparse pages (scanned/image-based content). The OCR fallback degrades gracefully if Tesseract is unavailable.
+- **Safe PDF Processing:** The default PDF engine uses PyMuPDF font-size and bold heuristics plus OCR for every sparse page. Built-in table detection is **on by default** so spreadsheet-exported PDFs keep their tables. `pymupdf4llm` layout mode remains available for structure-heavy documents.
 - **YouTube Integration:** Fetches transcripts directly via the YouTube transcript API, or transcribes locally with Whisper via `handle_yt_local` (audio-only download, no FFmpeg required).
 - **Configurable Whisper:** Pick the transcription model size per call (`whisper_model="medium"`) or globally via the `ANY_TO_MARKDOWN_WHISPER_MODEL` environment variable.
-- **Honest Concurrency:** Small files run in parallel, files over 200MB run sequentially, and Whisper transcription jobs are limited to one at a time by default.
+- **Honest Concurrency:** Small files run in parallel, PDFs default to half-the-CPU-cores concurrent jobs, files over 200MB run sequentially, and Whisper transcription jobs are limited to one at a time by default.
 - **Secure & Private:** Sanitizes error messages to prevent leaking system paths and sensitive information; URLs in error messages are preserved for context.
 - **No Overwrites:** Collision-resistant, race-free output naming.
 - **Typed:** Ships a `py.typed` marker, so mypy and pyright consume the package's annotations.
@@ -79,6 +79,9 @@ any-to-markdown ./my_docs -o converted/
 # PDF layout engine + a bigger Whisper model
 any-to-markdown report.pdf lecture.mp3 --layout --whisper-model medium
 
+# Disable built-in PDF table detection (it's on by default) and limit concurrency
+any-to-markdown report.pdf --no-pdf-tables --max-pdf-tasks 1
+
 # Show the version
 any-to-markdown --version
 ```
@@ -89,6 +92,8 @@ Options:
 | ------------------------ | --------------------------------------------------- |
 | `-o, --output-dir PATH`  | Output directory (defaults to `./raw_data`)         |
 | `--layout`               | Use the `pymupdf4llm` layout engine for PDFs        |
+| `--pdf-tables/--no-pdf-tables` | Toggle built-in PyMuPDF table detection (default on) |
+| `--max-pdf-tasks N`      | Concurrent PDF conversions (default: half the CPU cores) |
 | `--max-transcriptions N` | Concurrent Whisper jobs (default 1)                 |
 | `--whisper-model SIZE`   | Whisper model size (`tiny`, `small`, `medium`, ...) |
 | `--version`              | Print the version and exit                          |
@@ -101,8 +106,8 @@ The command prints one line per input and exits with code `1` if any input error
 
 The package exports the following from `any_to_markdown`:
 
-- `get_markdown(inputs, use_layout_engine=False, max_transcriptions=1, output_dir=None, whisper_model=None, show_progress=True)`
-- `get_markdown_directory(directory_path, use_layout_engine=False, max_transcriptions=1, output_dir=None, whisper_model=None, show_progress=True)`
+- `get_markdown(inputs, use_layout_engine=False, max_transcriptions=1, output_dir=None, whisper_model=None, show_progress=True, extract_pdf_tables=True, max_pdf_tasks=MAX_CONCURRENT_PDFS)`
+- `get_markdown_directory(directory_path, use_layout_engine=False, max_transcriptions=1, output_dir=None, whisper_model=None, show_progress=True, extract_pdf_tables=True, max_pdf_tasks=MAX_CONCURRENT_PDFS)`
 - `handle_yt_local(urls, max_transcriptions=1, output_dir=None, whisper_model=None, show_progress=True)`
 - `handle_yt_local_async(...)` (same signature, awaitable)
 - `ConversionResult`, `ConversionStatus`, `MissingDependencyError`, `TranscriptUnavailableError`
@@ -133,6 +138,17 @@ results = await get_markdown("input.pdf", use_layout_engine=True)
 ```
 
 This mode is heuristic-based (not AI-powered): it relies on `pymupdf4llm`'s rules for detecting tables, headings, and document structure.
+
+The built-in PyMuPDF table detector runs by default, so spreadsheet-exported
+PDFs (e.g. from Excel) keep their tables without extra configuration:
+
+```python
+results = await get_markdown("input.pdf", max_pdf_tasks=1)
+```
+
+To disable it (e.g. for a huge text-only document where `find_tables()` adds
+cost without benefit), pass `extract_pdf_tables=False` or set
+`ANY_TO_MARKDOWN_PDF_TABLES=0`.
 
 ### Choosing a Whisper Model
 
@@ -249,6 +265,7 @@ results = await handle_yt_local_async(urls, max_transcriptions=2, output_dir="tr
 ## Concurrency Model
 
 - Up to **10** small files are processed concurrently.
+- PDFs use a separate limit of **half the CPU cores** concurrent conversions by default (`MAX_CONCURRENT_PDFS`), since `find_tables()` and Tesseract OCR are each single-threaded CPU work. Tune it with `max_pdf_tasks`; lower it to `1` for constrained systems.
 - Files larger than **200MB** are processed sequentially to avoid out-of-memory errors.
 - Audio and video files (`.mp3`, `.wav`, `.m4a`, `.mp4`) always go through a dedicated transcription semaphore so only **one Whisper job** runs at a time by default. Tune this with `max_transcriptions`.
 - `handle_yt_local` downloads are capped at **200MB** (`MAX_DOWNLOAD_SIZE`), independently of the concurrency threshold.
@@ -256,6 +273,8 @@ results = await handle_yt_local_async(urls, max_transcriptions=2, output_dir="tr
 ## Troubleshooting & Tips
 
 - **OCR Quality:** Depends on your local Tesseract installation and image resolution.
+- **PDF OCR:** OCR runs on **every** sparse page (< 100 chars of text) — there is no per-PDF page cap and no total time budget, so long scanned documents are converted in full rather than truncated. A generous per-page timeout (`ANY_TO_MARKDOWN_OCR_TIMEOUT`, default 60s — covers dense numeric-table pages which can take 30-50s while the median page is ~1s) acts only as a reactive safety net to kill a genuinely wedged process; it never skips content in the normal case. Set it to `0` to disable it entirely.
+- **PDF Tables:** Built-in table detection is **on by default** so spreadsheet PDFs keep their tables. Disable with `extract_pdf_tables=False`, `--no-pdf-tables`, or `ANY_TO_MARKDOWN_PDF_TABLES=0`.
 - **Whisper Performance:** On the first run, the selected Whisper model is downloaded (cached locally). CPU performance is optimized using `int8` quantization.
 - **Encoding:** `.txt`/`.md` files are decoded as UTF-8 (BOM-aware) with a lossless Latin-1 fallback, so legacy files never fail the batch.
 - **Privacy:** Error messages are sanitized to remove absolute local paths before being surfaced. URLs are kept intact for context.

@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import threading
+import time
 from pathlib import Path
 
 import pytest
@@ -64,6 +66,18 @@ def test_get_markdown_custom_output_dir_returns_success_message(
     assert not (tmp_path / "raw_data").exists()
 
 
+def test_get_markdown_preserves_v022_positional_arguments(tmp_path: Path) -> None:
+    source = tmp_path / "note.txt"
+    source.write_text("positional compatibility", encoding="utf-8")
+    out_dir = tmp_path / "out"
+
+    results = asyncio.run(main.get_markdown(source, False, 1, out_dir, None, False))
+
+    assert results[0].ok
+    assert results[0].output_path is not None
+    assert results[0].output_path.parent == out_dir
+
+
 def test_one_failure_never_kills_the_batch(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.chdir(tmp_path)
     good = tmp_path / "good.txt"
@@ -114,6 +128,51 @@ def test_download_cap_is_distinct_from_concurrency_threshold() -> None:
     # Both exist independently so tuning one never silently changes the other.
     assert main.MAX_DOWNLOAD_SIZE == 200 * 1024 * 1024
     assert main.MAX_PARALLEL_SIZE == 200 * 1024 * 1024
+
+
+def test_pdf_tasks_use_dedicated_concurrency_limit(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    active = 0
+    peak_active = 0
+    lock = threading.Lock()
+    seen_table_flags: list[bool] = []
+
+    def fake_handle_pdf(path: Path, use_layout_engine: bool, extract_tables: bool) -> str:
+        nonlocal active, peak_active
+        with lock:
+            active += 1
+            peak_active = max(peak_active, active)
+            seen_table_flags.append(extract_tables)
+        time.sleep(0.05)
+        with lock:
+            active -= 1
+        return f"converted {path.name}"
+
+    monkeypatch.setitem(main.HANDLERS, ".pdf", fake_handle_pdf)
+    pdfs = []
+    for i in range(5):
+        path = tmp_path / f"{i}.pdf"
+        path.write_bytes(b"fake")
+        pdfs.append(path)
+
+    results = asyncio.run(
+        main.get_markdown(
+            pdfs,
+            extract_pdf_tables=True,
+            max_pdf_tasks=2,
+            output_dir=tmp_path / "out",
+            show_progress=False,
+        )
+    )
+
+    assert all(result.ok for result in results)
+    assert peak_active == 2
+    assert seen_table_flags == [True] * 5
+
+
+@pytest.mark.parametrize("argument", ["max_pdf_tasks", "max_transcriptions"])
+def test_concurrency_limits_must_be_positive(argument: str) -> None:
+    with pytest.raises(ValueError, match="must be at least 1"):
+        asyncio.run(main.get_markdown([], **{argument: 0}))
 
 
 def test_show_progress_param_accepted_by_all_public_functions(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

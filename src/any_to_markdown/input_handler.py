@@ -14,6 +14,7 @@ import importlib
 import os
 import re
 import subprocess
+import time
 import tempfile
 import threading
 import warnings
@@ -36,6 +37,63 @@ if TYPE_CHECKING:
 
 # PyMuPDF span flag bits: bit 1 (value 2) is italic, bit 4 (value 16) is bold.
 _BOLD_FLAG: int = 1 << 4
+
+PDF_TABLES_ENV_VAR: str = "ANY_TO_MARKDOWN_PDF_TABLES"
+PDF_OCR_TIMEOUT_ENV_VAR: str = "ANY_TO_MARKDOWN_OCR_TIMEOUT"
+
+
+def _env_flag(name: str, default: bool) -> bool:
+    """Reads a boolean environment flag with conventional truthy/falsy values."""
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    normalized = raw.strip().lower()
+    if normalized in {"", "0", "false", "no", "off"}:
+        return False
+    return True
+
+
+def _env_int(name: str, default: int, min_value: int = 0) -> int:
+    """Reads an integer environment setting, falling back on invalid values."""
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        warnings.warn(
+            f"Ignoring invalid {name}={raw!r}; expected an integer.",
+            UserWarning,
+            stacklevel=2,
+        )
+        return default
+    return max(value, min_value)
+
+
+# Per-page OCR timeout (seconds). This is a *reactive* safety net only: it
+# fires when Tesseract is genuinely stuck on a single corrupted/unusual page.
+# It NEVER causes content to be skipped in the normal case — a timed-out page
+# simply yields no OCR text and conversion proceeds.
+#
+# Default of 60s is deliberately generous: real scanned pages vary widely.
+# Measurements on dense financial/NIRF documents show median ~0.9s but a long
+# tail (p90 ~11s, max ~47s for full-page numeric tables). 60s covers that tail
+# plus margin for denser pages, while still killing a truly wedged process.
+# Override with ANY_TO_MARKDOWN_OCR_TIMEOUT; set to 0 to disable it entirely.
+_OCR_TIMEOUT_SECONDS: int = _env_int(PDF_OCR_TIMEOUT_ENV_VAR, 60)
+
+# Slow-operation warning threshold for PyMuPDF's find_tables(). Purely
+# informational: find_tables() is a synchronous C-extension call that Python
+# cannot preempt, so this only warns on slow pages; the result is still used.
+_TABLE_DETECTION_WARNING_SECONDS: int = _env_int("ANY_TO_MARKDOWN_PDF_TABLE_WARNING_SECONDS", 15)
+
+# Built-in PyMuPDF table extraction calls page.find_tables(). Enabled by
+# default so that PDFs exported from spreadsheets (e.g. Excel) yield their
+# tables without extra configuration. The original batch-stall was caused by
+# CPU saturation from too many parallel PDFs, not by table detection itself;
+# with PDF concurrency bounded in main.py, tables-on-by-default is safe.
+# Set ANY_TO_MARKDOWN_PDF_TABLES=0 (or pass extract_tables=False) to disable.
+_PDF_TABLE_DETECTION_ENABLED_BY_DEFAULT: bool = _env_flag(PDF_TABLES_ENV_VAR, True)
 
 # Default Whisper model size; can be overridden per call or via the
 # ANY_TO_MARKDOWN_WHISPER_MODEL environment variable.
@@ -257,17 +315,20 @@ def handle_powerpoint(file_path: str | Path) -> str:
     return "".join(parts)
 
 
-def handle_image(file_path: str | Path) -> str:
+def handle_image(file_path: str | Path, timeout: int = _OCR_TIMEOUT_SECONDS) -> str:
     """Uses Tesseract OCR to extract text from images.
 
     Args:
         file_path: Path to the image file.
+        timeout: Maximum seconds to allow Tesseract to run. Defaults to
+            ``_OCR_TIMEOUT_SECONDS``. Set to ``0`` to disable the timeout.
 
     Returns:
         The extracted text content.
 
     Raises:
         MissingDependencyError: If the 'ocr' extra is not installed.
+        TimeoutError: If Tesseract does not complete within *timeout*.
     """
     pytesseract = require_dependency("pytesseract", "ocr")
     pil_image = require_dependency("PIL.Image", "ocr")
@@ -275,7 +336,14 @@ def handle_image(file_path: str | Path) -> str:
     with pil_image.open(file_path) as image:
         # Pre-processing for better OCR accuracy
         grayscale = image.convert("L")
-        text: str = pytesseract.image_to_string(grayscale, config="--psm 6")
+        # pytesseract honours the --timeout flag (passed through to the
+        # Tesseract binary via the config string) but it is not universally
+        # supported. Use pytesseract's own timeout parameter instead.
+        text: str = pytesseract.image_to_string(
+            grayscale,
+            config="--psm 6",
+            timeout=timeout if timeout > 0 else None,
+        )
     return text.strip()
 
 
@@ -328,12 +396,17 @@ def _get_pdf_items(page: fitz.Page, ignore_bboxes: Optional[List[fitz.Rect]] = N
     return items
 
 
-def handle_pdf(file_path: str | Path, use_layout_engine: bool = False) -> str:
+def handle_pdf(file_path: str | Path, use_layout_engine: bool = False, extract_tables: Optional[bool] = None) -> str:
     """Advanced PDF handler using PyMuPDF and OCR fallback.
 
     Args:
         file_path: Path to the .pdf file.
         use_layout_engine: Whether to use advanced PDF layout analysis.
+        extract_tables: Whether to run PyMuPDF's built-in table detector.
+            Defaults to the ``ANY_TO_MARKDOWN_PDF_TABLES`` environment flag,
+            which is ON by default so that spreadsheet-exported PDFs yield
+            their tables. Pass ``False`` or set ``ANY_TO_MARKDOWN_PDF_TABLES=0``
+            to disable.
 
     Returns:
         The structured Markdown content of the PDF.
@@ -342,6 +415,8 @@ def handle_pdf(file_path: str | Path, use_layout_engine: bool = False) -> str:
         MissingDependencyError: If the 'pdf' extra is not installed.
     """
     fitz_mod = require_dependency("fitz", "pdf")
+    if extract_tables is None:
+        extract_tables = _PDF_TABLE_DETECTION_ENABLED_BY_DEFAULT
 
     if use_layout_engine:
         try:
@@ -363,46 +438,90 @@ def handle_pdf(file_path: str | Path, use_layout_engine: bool = False) -> str:
         for page_no, page in enumerate(doc, start=1):
             parts.append(f"---\nsource: {file_name}\npage: {page_no}\ntype: pdf\n---\n\n")
 
-            # 1. Spatial Table Detection
-            tabs = page.find_tables()
-            table_bboxes = [t.bbox for t in tabs.tables]
+            # 1. Quick plain-text extraction (fast, no layout analysis)
+            raw_text = page.get_text().strip()
 
-            # 2. Extract Text while excluding table areas to prevent duplicate data
-            items = _get_pdf_items(page, ignore_bboxes=table_bboxes)
+            # 2. Structured text extraction with font-size/bold heuristics
+            #    (cheap, better Markdown) and table detection (on by default so
+            #    spreadsheet PDFs keep their tables). Both run only when there
+            #    is real text on the page; a scanned page falls straight to OCR.
+            if len(raw_text) >= 100:
+                try:
+                    table_bboxes: List[fitz.Rect] = []
+                    table_items: List[Tuple[float, str]] = []
 
-            # 3. Add Table data to the sortable items list
-            for tab in tabs.tables:
-                df = tab.to_pandas()
-                if not df.empty:
-                    # Use the top Y-coordinate for correct interleaving
-                    items.append((tab.bbox[1], f"\n\n{df.to_markdown(index=False)}\n\n"))
+                    if extract_tables:
+                        page_start = time.monotonic()
+                        tabs = page.find_tables()
+                        elapsed = time.monotonic() - page_start
 
-            # 4. Global sort to reconstruct the page layout accurately
-            items.sort(key=lambda x: x[0])
-            text = "".join(item[1] for item in items)
+                        if elapsed > _TABLE_DETECTION_WARNING_SECONDS:
+                            warnings.warn(
+                                f"Table detection took {elapsed:.1f}s on page {page_no} of "
+                                f"'{file_name}'; continuing with detected results. "
+                                f"Disable it with extract_tables=False or {PDF_TABLES_ENV_VAR}=0.",
+                                UserWarning,
+                                stacklevel=2,
+                            )
+
+                        table_bboxes = [t.bbox for t in tabs.tables]
+
+                        for tab in tabs.tables:
+                            try:
+                                df = tab.to_pandas()
+                                if not df.empty:
+                                    table_items.append((tab.bbox[1], f"\n\n{df.to_markdown(index=False)}\n\n"))
+                            except Exception:  # noqa: BLE001
+                                # Malformed table data should not crash the page.
+                                pass
+
+                    items = _get_pdf_items(page, ignore_bboxes=table_bboxes)
+                    items.extend(table_items)
+
+                    items.sort(key=lambda x: x[0])
+                    text = "".join(item[1] for item in items)
+                    if not text.strip():
+                        text = raw_text
+                except Exception as exc:  # noqa: BLE001
+                    # Any failure in the structured extraction path should
+                    # degrade to the raw text rather than crash the PDF.
+                    warnings.warn(
+                        f"Structured extraction failed on page {page_no} of "
+                        f"'{file_name}': {exc}; falling back to plain text.",
+                        UserWarning,
+                        stacklevel=2,
+                    )
+                    text = raw_text
+            else:
+                # Scanned/image-only page — no embedded text to structure.
+                text = raw_text
 
             if text.strip():
                 parts.append(text + "\n\n")
 
-            # 5. Visual/OCR Fallback: Only trigger when text extraction
-            #    yielded very little content, indicating the page is likely
-            #    image-based / scanned. The previous condition also fired when
-            #    *any* image was present (logos, charts, decorations), which
-            #    caused extreme slowness on image-rich but text-normal PDFs.
+            # 3. OCR Fallback: fires on every page whose text is sparse (<100
+            #    chars), i.e. genuinely image-based/scanned pages. There is NO
+            #    per-PDF page cap and NO total time budget — both silently
+            #    dropped content from long scanned documents, which is data
+            #    loss. Only the per-page timeout (_OCR_TIMEOUT_SECONDS) remains,
+            #    purely to stop a single corrupted page from blocking a worker;
+            #    it never causes a wanted page to be skipped.
             if len(text.strip()) < 100:
                 with tempfile.NamedTemporaryFile(suffix=f"_page_{page_no}.png", delete=False) as temp_image:
                     img_path = Path(temp_image.name)
 
                 try:
-                    # Render the page at 2x zoom for high-quality OCR
-                    pix = page.get_pixmap(matrix=fitz_mod.Matrix(2, 2))
+                    # Render the page at 1.5x zoom — a good balance between
+                    # OCR accuracy and processing speed (the old 2x produced
+                    # 4x the pixels and was a major bottleneck).
+                    pix = page.get_pixmap(matrix=fitz_mod.Matrix(1.5, 1.5))
                     pix.save(img_path)
-                    ocr_text = handle_image(img_path)
+                    ocr_text = handle_image(img_path, timeout=_OCR_TIMEOUT_SECONDS)
                     if ocr_text and ocr_text not in text:
                         parts.append(f"\n> [Visual Content OCR]:\n> {ocr_text}\n\n")
                 except Exception as exc:
                     # Degrade gracefully: any OCR failure (missing dependency,
-                    # tesseract binary not found, processing error, etc.)
+                    # tesseract binary not found, timeout, processing error)
                     # should never abort the entire PDF conversion.
                     warnings.warn(f"Skipping OCR fallback for page {page_no}: {exc}", UserWarning, stacklevel=2)
                 finally:

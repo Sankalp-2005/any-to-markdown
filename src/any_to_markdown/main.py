@@ -35,6 +35,14 @@ MAX_DOWNLOAD_SIZE: int = 200 * 1024 * 1024  # 200MB
 # Number of concurrent tasks allowed for smaller files.
 MAX_CONCURRENT_TASKS: int = 10
 
+# PDFs are CPU- and memory-heavy even when their files are small. find_tables()
+# and Tesseract OCR are each single-threaded CPU work, so running one per core
+# saturates the CPU. We default to half the cores: enough to keep every core
+# busy while leaving headroom for the small-file pool and the OS. On an 8-core
+# machine this gives 4 parallel PDFs; on 16, eight. Override per-run with
+# --max-pdf-tasks (CLI) or max_pdf_tasks (API).
+MAX_CONCURRENT_PDFS: int = max(1, (os.cpu_count() or 4) // 2)
+
 # Extensions that require Whisper transcription. These are always routed through
 # a dedicated transcription semaphore so that multiple Whisper jobs never run
 # concurrently, regardless of file size.
@@ -238,6 +246,7 @@ async def _process_input(
     input_val: str | Path,
     semaphore: asyncio.Semaphore,
     use_layout_engine: bool = False,
+    extract_pdf_tables: Optional[bool] = None,
     yt_id: Optional[str] = None,
     whisper_model: Optional[str] = None,
 ) -> str:
@@ -247,6 +256,7 @@ async def _process_input(
         input_val: The input file path or YouTube URL (validated upstream).
         semaphore: The concurrency gate to respect.
         use_layout_engine: Whether to use advanced PDF layout analysis.
+        extract_pdf_tables: Whether to run built-in PyMuPDF table detection.
         yt_id: Pre-extracted YouTube video ID, or None for local files. The
             ID is computed exactly once by the caller and carried through.
         whisper_model: Optional Whisper model size for transcription jobs.
@@ -273,7 +283,7 @@ async def _process_input(
 
         if ext == ".pdf":
             # PDF pages embed their own per-page metadata headers.
-            return await asyncio.to_thread(handler, file_path, use_layout_engine)
+            return await asyncio.to_thread(handler, file_path, use_layout_engine, extract_pdf_tables)
 
         metadata_header = f"\n---\nsource: {file_path.name}\ntype: {ext.lstrip('.')}\n---\n\n"
         if ext in TRANSCRIPTION_EXTENSIONS:
@@ -324,6 +334,8 @@ async def get_markdown(
     output_dir: str | Path | None = None,
     whisper_model: Optional[str] = None,
     show_progress: bool = True,
+    extract_pdf_tables: Optional[bool] = None,
+    max_pdf_tasks: int = MAX_CONCURRENT_PDFS,
 ) -> List[ConversionResult]:
     """The main conversion engine for a batch of files and YouTube URLs.
 
@@ -347,6 +359,14 @@ async def get_markdown(
             stderr during conversion. Automatically suppressed when stderr is
             not a TTY (e.g. piped output, CI logs) or when the
             ANY_TO_MARKDOWN_NO_PROGRESS environment variable is set.
+        extract_pdf_tables: Whether to run PyMuPDF's built-in table detector.
+            ``None`` (default) respects the ``ANY_TO_MARKDOWN_PDF_TABLES`` env
+            flag, which is ON by default so spreadsheet PDFs keep their tables.
+            Pass ``True``/``False`` to force-enable/force-disable.
+        max_pdf_tasks: Maximum number of PDFs processed concurrently. Defaults
+            to half the CPU cores (``MAX_CONCURRENT_PDFS``) so PDF jobs
+            saturate the CPU without starving other work; tune per-run for
+            constrained systems.
 
     Returns:
         One ConversionResult per input, in input order. Successful results
@@ -359,10 +379,16 @@ async def get_markdown(
     else:
         input_list = list(inputs)
 
+    if max_pdf_tasks < 1:
+        raise ValueError("max_pdf_tasks must be at least 1")
+    if max_transcriptions < 1:
+        raise ValueError("max_transcriptions must be at least 1")
+
     custom_output = output_dir is not None
     out_dir = Path(output_dir) if output_dir is not None else Path.cwd() / DEFAULT_OUTPUT_DIR
 
     small_task_semaphore = asyncio.Semaphore(MAX_CONCURRENT_TASKS)
+    pdf_semaphore = asyncio.Semaphore(max_pdf_tasks)
     large_file_semaphore = asyncio.Semaphore(1)
     transcription_semaphore = asyncio.Semaphore(max_transcriptions)
 
@@ -400,14 +426,26 @@ async def get_markdown(
             )
             continue
 
+        file_size = file_path.stat().st_size
         if ext in TRANSCRIPTION_EXTENSIONS:
             # Whisper jobs are CPU/memory heavy: never run N of them in
             # parallel, regardless of how small the files are.
             sem = transcription_semaphore
+        elif file_size > MAX_PARALLEL_SIZE:
+            sem = large_file_semaphore
+        elif ext == ".pdf":
+            sem = pdf_semaphore
         else:
-            file_size = file_path.stat().st_size
-            sem = small_task_semaphore if file_size <= MAX_PARALLEL_SIZE else large_file_semaphore
-        tasks[i] = asyncio.create_task(_process_input(file_path, sem, use_layout_engine, whisper_model=whisper_model))
+            sem = small_task_semaphore
+        tasks[i] = asyncio.create_task(
+            _process_input(
+                file_path,
+                sem,
+                use_layout_engine=use_layout_engine,
+                extract_pdf_tables=extract_pdf_tables,
+                whisper_model=whisper_model,
+            )
+        )
 
     pending = [t for t in tasks if t is not None]
     if pending:
@@ -464,6 +502,8 @@ async def get_markdown_directory(
     output_dir: str | Path | None = None,
     whisper_model: Optional[str] = None,
     show_progress: bool = True,
+    extract_pdf_tables: Optional[bool] = None,
+    max_pdf_tasks: int = MAX_CONCURRENT_PDFS,
 ) -> List[ConversionResult]:
     """Crawls a directory recursively and converts supported files.
 
@@ -477,6 +517,11 @@ async def get_markdown_directory(
         show_progress: When True (default), render a live progress bar to
             stderr. Suppressed on non-TTY or when
             ANY_TO_MARKDOWN_NO_PROGRESS is set.
+        extract_pdf_tables: Whether to run built-in PyMuPDF table detection.
+            ``None`` (default) respects the ``ANY_TO_MARKDOWN_PDF_TABLES`` env
+            flag, which is ON by default. Pass ``True``/``False`` to override.
+        max_pdf_tasks: Maximum number of PDFs processed concurrently.
+            Defaults to half the CPU cores (``MAX_CONCURRENT_PDFS``).
 
     Returns:
         A list of ConversionResult objects; empty if the directory contains
@@ -503,6 +548,8 @@ async def get_markdown_directory(
     return await get_markdown(
         file_list,
         use_layout_engine=use_layout_engine,
+        extract_pdf_tables=extract_pdf_tables,
+        max_pdf_tasks=max_pdf_tasks,
         max_transcriptions=max_transcriptions,
         output_dir=output_dir,
         whisper_model=whisper_model,
